@@ -45,6 +45,12 @@ def setup_parser(parser):
         metavar=("LO", "HI"),
         help="Variable grid search ratio range (default: 3 10)",
     )
+    parser.add_argument(
+        "--max-atoms",
+        type=int,
+        default=None,
+        help="Skip molecules with more than N heavy atoms",
+    )
 
 
 def _load_pdb_ids_from_sweep(results_dir: Path) -> list[str]:
@@ -73,6 +79,7 @@ def execute(args):
         generate_variable_mapping,
         grid_search_variable,
     )
+    from adaptive_cg.core.strategies import kmeans_mapping, hierarchical_mapping
 
     data_dir = args.data_dir
     output_dir = args.output_dir
@@ -111,6 +118,10 @@ def execute(args):
         except Exception as e:
             print(f"LOAD FAILED: {e}")
             n_fail += 1
+            continue
+
+        if args.max_atoms and mol.n_atoms > args.max_atoms:
+            print(f"SKIP ({mol.n_atoms} atoms > {args.max_atoms})")
             continue
 
         if len(mol.region_names) < 2:
@@ -163,6 +174,48 @@ def execute(args):
                 aa_dmat=aa_dmat,
             )
 
+        # -- K-means and hierarchical mappings --
+        target_beads = best_uniform["n_beads"]
+        try:
+            km_mapping = kmeans_mapping(mol.positions, mol.masses, target_beads)
+            km_breakdown = eval_mapping_by_region(
+                km_mapping, mol.positions, mol.masses,
+                mol.region_labels, mol.region_names,
+                aa_dmat=aa_dmat,
+            )
+        except Exception:
+            km_mapping = None
+            km_breakdown = None
+
+        try:
+            hi_mapping = hierarchical_mapping(mol.positions, mol.masses, target_beads)
+            hi_breakdown = eval_mapping_by_region(
+                hi_mapping, mol.positions, mol.masses,
+                mol.region_labels, mol.region_names,
+                aa_dmat=aa_dmat,
+            )
+        except Exception:
+            hi_mapping = None
+            hi_breakdown = None
+
+        # -- Analyze bead distribution across regions for each strategy --
+        def _bead_region_distribution(mapping, region_labels, region_names):
+            """Count how many beads are assigned to each region (by majority vote)."""
+            counts = {rn: 0 for rn in region_names}
+            for group in mapping:
+                labels_in_bead = region_labels[group]
+                majority = int(np.bincount(labels_in_bead).argmax())
+                if majority < len(region_names):
+                    counts[region_names[majority]] += 1
+            return counts
+
+        uniform_bead_dist = _bead_region_distribution(
+            uniform_mapping, mol.region_labels, mol.region_names)
+        km_bead_dist = _bead_region_distribution(
+            km_mapping, mol.region_labels, mol.region_names) if km_mapping else None
+        hi_bead_dist = _bead_region_distribution(
+            hi_mapping, mol.region_labels, mol.region_names) if hi_mapping else None
+
         # -- Build per-molecule result --
         mol_result = {
             "pdb_id": pdb_id,
@@ -176,6 +229,7 @@ def execute(args):
                 "global_rmse": uniform_breakdown["global_rmse"],
                 "per_region": uniform_breakdown["per_region"],
                 "cross_region": uniform_breakdown["cross_region"],
+                "bead_distribution": uniform_bead_dist,
             },
         }
 
@@ -188,31 +242,61 @@ def execute(args):
                 "cross_region": variable_breakdown["cross_region"],
             }
 
-            # Compute per-region improvements
+        if km_breakdown:
+            mol_result["kmeans"] = {
+                "n_beads": len(km_mapping),
+                "global_rmse": km_breakdown["global_rmse"],
+                "per_region": km_breakdown["per_region"],
+                "cross_region": km_breakdown["cross_region"],
+                "bead_distribution": km_bead_dist,
+            }
+
+        if hi_breakdown:
+            mol_result["hierarchical"] = {
+                "n_beads": len(hi_mapping),
+                "global_rmse": hi_breakdown["global_rmse"],
+                "per_region": hi_breakdown["per_region"],
+                "cross_region": hi_breakdown["cross_region"],
+                "bead_distribution": hi_bead_dist,
+            }
+
+            # Compute per-region improvements for all strategies vs uniform
             mol_result["region_improvements"] = {}
             for rname in mol.region_names:
                 uni_r = uniform_breakdown["per_region"].get(rname, {})
-                var_r = variable_breakdown["per_region"].get(rname, {})
                 uni_rmse = uni_r.get("rmse", 0.0)
-                var_rmse = var_r.get("rmse", 0.0)
-                if uni_rmse > 0 and uni_r.get("n_pairs", 0) > 0:
-                    imp_nm = uni_rmse - var_rmse
-                    imp_pct = imp_nm / uni_rmse * 100
-                else:
-                    imp_nm = 0.0
-                    imp_pct = 0.0
-                mol_result["region_improvements"][rname] = {
-                    "improvement_nm": imp_nm,
-                    "improvement_pct": imp_pct,
-                }
+                n_pairs = uni_r.get("n_pairs", 0)
+
+                entry = {"uniform_rmse": uni_rmse, "n_pairs": n_pairs}
+
+                for strat_name, strat_breakdown in [
+                    ("grid_search", variable_breakdown),
+                    ("kmeans", km_breakdown),
+                    ("hierarchical", hi_breakdown),
+                ]:
+                    if strat_breakdown is None:
+                        continue
+                    s_r = strat_breakdown["per_region"].get(rname, {})
+                    s_rmse = s_r.get("rmse", 0.0)
+                    if uni_rmse > 0 and n_pairs > 0:
+                        imp_nm = uni_rmse - s_rmse
+                        imp_pct = imp_nm / uni_rmse * 100
+                    else:
+                        imp_nm = 0.0
+                        imp_pct = 0.0
+                    entry[f"{strat_name}_rmse"] = s_rmse
+                    entry[f"{strat_name}_improvement_pct"] = imp_pct
+
+                mol_result["region_improvements"][rname] = entry
+
                 # Accumulate for aggregate table
                 all_region_improvements.setdefault(rname, []).append({
                     "pdb_id": pdb_id,
                     "uniform_rmse": uni_rmse,
-                    "variable_rmse": var_rmse,
-                    "improvement_nm": imp_nm,
-                    "improvement_pct": imp_pct,
-                    "n_pairs": uni_r.get("n_pairs", 0),
+                    "variable_rmse": variable_breakdown["per_region"].get(rname, {}).get("rmse", 0.0) if variable_breakdown else None,
+                    "kmeans_rmse": km_breakdown["per_region"].get(rname, {}).get("rmse", 0.0) if km_breakdown else None,
+                    "hierarchical_rmse": hi_breakdown["per_region"].get(rname, {}).get("rmse", 0.0) if hi_breakdown else None,
+                    "n_pairs": n_pairs,
                 })
 
         # Save per-molecule JSON
@@ -225,13 +309,14 @@ def execute(args):
         n_success += 1
 
         # Print summary line
-        regions_str = "  ".join(
-            f"{rname}={uniform_breakdown['per_region'].get(rname, {}).get('rmse', 0.0):.4f}"
-            for rname in mol.region_names
+        km_str = f"km={km_breakdown['global_rmse']:.4f}" if km_breakdown else "km=N/A"
+        hi_str = f"hi={hi_breakdown['global_rmse']:.4f}" if hi_breakdown else "hi=N/A"
+        print(
+            f"{mol.n_atoms} atoms, uni={uniform_breakdown['global_rmse']:.4f}, "
+            f"{km_str}, {hi_str}"
         )
-        print(f"{mol.n_atoms} atoms, uni_global={uniform_breakdown['global_rmse']:.4f}, {regions_str}")
 
-        del mol, uniform_results, variable_result, aa_dmat
+        del mol, uniform_results, variable_result, aa_dmat, km_mapping, hi_mapping
         gc.collect()
 
     # ------------------------------------------------------------------
@@ -244,9 +329,9 @@ def execute(args):
     print()
 
     if all_region_improvements:
-        print("Per-region mean improvement (variable vs uniform):")
-        print(f"  {'Region':<15s} {'Mean Imp%':>10s} {'Mean Imp nm':>12s} "
-              f"{'Uni RMSE':>10s} {'Var RMSE':>10s} {'N molecules':>12s}")
+        print("Per-region mean RMSE by strategy:")
+        print(f"  {'Region':<15s} {'Uniform':>10s} {'GridSrch':>10s} "
+              f"{'K-means':>10s} {'Hierarch':>10s} {'N':>4s}")
         print("-" * 70)
 
         aggregate = {}
@@ -254,24 +339,72 @@ def execute(args):
             valid = [e for e in entries if e["n_pairs"] > 0]
             if not valid:
                 continue
-            import numpy as np
-            imp_pcts = np.array([e["improvement_pct"] for e in valid])
-            imp_nms = np.array([e["improvement_nm"] for e in valid])
+
             uni_rmses = np.array([e["uniform_rmse"] for e in valid])
-            var_rmses = np.array([e["variable_rmse"] for e in valid])
+            gs_rmses = np.array([e["variable_rmse"] for e in valid if e.get("variable_rmse") is not None])
+            km_rmses = np.array([e["kmeans_rmse"] for e in valid if e.get("kmeans_rmse") is not None])
+            hi_rmses = np.array([e["hierarchical_rmse"] for e in valid if e.get("hierarchical_rmse") is not None])
 
             aggregate[rname] = {
-                "mean_improvement_pct": float(imp_pcts.mean()),
-                "mean_improvement_nm": float(imp_nms.mean()),
                 "mean_uniform_rmse": float(uni_rmses.mean()),
-                "mean_variable_rmse": float(var_rmses.mean()),
+                "mean_grid_search_rmse": float(gs_rmses.mean()) if len(gs_rmses) else None,
+                "mean_kmeans_rmse": float(km_rmses.mean()) if len(km_rmses) else None,
+                "mean_hierarchical_rmse": float(hi_rmses.mean()) if len(hi_rmses) else None,
                 "n_molecules": len(valid),
             }
 
+            gs_str = f"{gs_rmses.mean():>10.6f}" if len(gs_rmses) else f"{'N/A':>10s}"
+            km_str = f"{km_rmses.mean():>10.6f}" if len(km_rmses) else f"{'N/A':>10s}"
+            hi_str = f"{hi_rmses.mean():>10.6f}" if len(hi_rmses) else f"{'N/A':>10s}"
             print(
-                f"  {rname:<15s} {imp_pcts.mean():>+9.1f}% {imp_nms.mean():>11.6f} "
-                f"{uni_rmses.mean():>10.6f} {var_rmses.mean():>10.6f} {len(valid):>12d}"
+                f"  {rname:<15s} {uni_rmses.mean():>10.6f} {gs_str} "
+                f"{km_str} {hi_str} {len(valid):>4d}"
             )
+
+        # Bead distribution analysis
+        print()
+        print("Mean bead allocation by region (atoms per bead = effective ratio):")
+        print(f"  {'Region':<15s} {'Atom%':>7s} {'Uni beads%':>11s} "
+              f"{'KM beads%':>11s} {'Hi beads%':>11s}")
+        print("-" * 65)
+
+        # Collect bead distribution data across molecules
+        for rname in sorted(set(r for row in summary_rows for r in row["region_names"])):
+            atom_pcts = []
+            uni_bead_pcts = []
+            km_bead_pcts = []
+            hi_bead_pcts = []
+            for row in summary_rows:
+                if rname not in row["region_names"]:
+                    continue
+                total_atoms = row["n_atoms"]
+                region_atoms = row["region_counts"].get(rname, 0)
+                atom_pcts.append(region_atoms / total_atoms * 100)
+
+                uni_total = sum(row["uniform"]["bead_distribution"].values())
+                if uni_total > 0:
+                    uni_bead_pcts.append(
+                        row["uniform"]["bead_distribution"].get(rname, 0) / uni_total * 100)
+
+                if "kmeans" in row and row["kmeans"].get("bead_distribution"):
+                    km_total = sum(row["kmeans"]["bead_distribution"].values())
+                    if km_total > 0:
+                        km_bead_pcts.append(
+                            row["kmeans"]["bead_distribution"].get(rname, 0) / km_total * 100)
+
+                if "hierarchical" in row and row["hierarchical"].get("bead_distribution"):
+                    hi_total = sum(row["hierarchical"]["bead_distribution"].values())
+                    if hi_total > 0:
+                        hi_bead_pcts.append(
+                            row["hierarchical"]["bead_distribution"].get(rname, 0) / hi_total * 100)
+
+            if not atom_pcts:
+                continue
+            a_str = f"{np.mean(atom_pcts):>6.1f}%"
+            u_str = f"{np.mean(uni_bead_pcts):>10.1f}%" if uni_bead_pcts else f"{'N/A':>11s}"
+            k_str = f"{np.mean(km_bead_pcts):>10.1f}%" if km_bead_pcts else f"{'N/A':>11s}"
+            h_str = f"{np.mean(hi_bead_pcts):>10.1f}%" if hi_bead_pcts else f"{'N/A':>11s}"
+            print(f"  {rname:<15s} {a_str} {u_str} {k_str} {h_str}")
 
         # Save aggregate
         agg_file = output_dir / "region_aggregate.json"
