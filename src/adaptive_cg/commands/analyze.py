@@ -56,11 +56,14 @@ def execute(args):
             for key in ("best_uniform_rmse", "best_uniform_mae",
                         "variable_rmse", "improvement_nm", "improvement_pct",
                         "optimize_rmse"):
-                if r.get(key):
+                val = r.get(key, "")
+                if val and val.strip():
                     try:
-                        r[key] = float(r[key])
+                        r[key] = float(val)
                     except (ValueError, TypeError):
                         r[key] = None
+                else:
+                    r[key] = None
             rows.append(r)
 
     print(f"Loaded {len(rows)} molecules from {csv_file}")
