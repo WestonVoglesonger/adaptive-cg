@@ -339,6 +339,108 @@ def grid_search_variable(
     return best_result
 
 
+def eval_mapping_by_region(
+    mapping: list[list[int]],
+    positions: np.ndarray,
+    masses: np.ndarray,
+    region_labels: np.ndarray,
+    region_names: list[str],
+    aa_dmat: np.ndarray | None = None,
+) -> dict:
+    """Evaluate CG mapping with RMSE broken down by region.
+
+    For each bead, determine its dominant region (majority of its atoms).
+    Then compute RMSE on sub-matrices of bead pairs grouped by region.
+
+    Parameters
+    ----------
+    mapping : list[list[int]]
+        Each inner list contains atom indices for one bead.
+    positions : np.ndarray, shape (n_atoms, 3)
+    masses : np.ndarray, shape (n_atoms,)
+    region_labels : np.ndarray, shape (n_atoms,)
+        Integer region label per atom.
+    region_names : list[str]
+        Human-readable name for each region index.
+    aa_dmat : np.ndarray or None
+        Pre-computed all-atom distance matrix.
+
+    Returns
+    -------
+    dict with keys:
+        global_rmse : float
+        bead_regions : list[int]  -- dominant region index per bead
+        per_region : dict[str, dict]  -- per same-region RMSE
+            Each value has: rmse, n_pairs
+        cross_region : dict[str, dict]  -- per cross-region pair RMSE
+            Keys like "helix-sheet", values have: rmse, n_pairs
+    """
+    # Global evaluation first
+    global_result = eval_mapping(mapping, positions, masses, aa_dmat=aa_dmat)
+    cg_dmat = global_result["cg_dmat"]
+    ref_dmat = global_result["ref_dmat"]
+    n_beads = len(mapping)
+
+    # Assign each bead its dominant region (majority vote of its atoms)
+    bead_regions = []
+    for group in mapping:
+        grp_labels = region_labels[group]
+        counts = np.bincount(grp_labels, minlength=len(region_names))
+        bead_regions.append(int(np.argmax(counts)))
+    bead_regions_arr = np.array(bead_regions, dtype=int)
+
+    # Compute per-region and cross-region RMSE from the distance matrices
+    per_region = {}
+    cross_region = {}
+
+    unique_regions = sorted(set(bead_regions))
+
+    for ri in unique_regions:
+        name_i = region_names[ri]
+        # Same-region pairs
+        mask_i = bead_regions_arr == ri
+        idx_i = np.where(mask_i)[0]
+        if len(idx_i) >= 2:
+            pairs = np.array([(a, b) for a in idx_i for b in idx_i if a < b])
+            cg_vals = cg_dmat[pairs[:, 0], pairs[:, 1]]
+            ref_vals = ref_dmat[pairs[:, 0], pairs[:, 1]]
+            diff = cg_vals - ref_vals
+            per_region[name_i] = {
+                "rmse": float(np.sqrt(np.mean(diff ** 2))),
+                "n_pairs": len(pairs),
+            }
+        else:
+            per_region[name_i] = {"rmse": 0.0, "n_pairs": 0}
+
+        # Cross-region pairs
+        for rj in unique_regions:
+            if rj <= ri:
+                continue
+            name_j = region_names[rj]
+            mask_j = bead_regions_arr == rj
+            idx_j = np.where(mask_j)[0]
+            if len(idx_i) > 0 and len(idx_j) > 0:
+                pairs = np.array(
+                    [(a, b) if a < b else (b, a)
+                     for a in idx_i for b in idx_j]
+                )
+                cg_vals = cg_dmat[pairs[:, 0], pairs[:, 1]]
+                ref_vals = ref_dmat[pairs[:, 0], pairs[:, 1]]
+                diff = cg_vals - ref_vals
+                key = f"{name_i}-{name_j}"
+                cross_region[key] = {
+                    "rmse": float(np.sqrt(np.mean(diff ** 2))),
+                    "n_pairs": len(pairs),
+                }
+
+    return {
+        "global_rmse": global_result["rmse"],
+        "bead_regions": bead_regions,
+        "per_region": per_region,
+        "cross_region": cross_region,
+    }
+
+
 def eval_uniform_baselines(
     positions: np.ndarray,
     masses: np.ndarray,

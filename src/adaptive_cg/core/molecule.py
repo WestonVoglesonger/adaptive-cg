@@ -65,11 +65,12 @@ class MoleculeData:
     region_labels: np.ndarray                  # (N,) int
     region_names: list[str]                    # human-readable per index
     mol_type: str                              # protein | nucleic_acid | small_molecule
+    region_counts: dict[str, int] = field(default_factory=dict)
 
     def __repr__(self) -> str:
         regions = ", ".join(
-            f"{name}={int((self.region_labels == i).sum())}"
-            for i, name in enumerate(self.region_names)
+            f"{name}={self.region_counts.get(name, 0)}"
+            for name in self.region_names
         )
         return (
             f"MoleculeData({self.name}, {self.mol_type}, "
@@ -108,12 +109,17 @@ def _detect_mol_type(residue_names: list[str]) -> str:
 # Region labelling
 # ---------------------------------------------------------------------------
 
-def _label_protein_regions(universe, atom_indices) -> tuple[np.ndarray, list[str]]:
+def _label_protein_regions(
+    pdb_path: Path, universe, atom_indices,
+) -> tuple[np.ndarray, list[str]]:
     """Assign helix / sheet / loop labels to protein heavy atoms.
 
-    Tries DSSP via MDAnalysis first.  Falls back to labelling everything
-    as 'loop' if DSSP is unavailable or fails.
+    Uses BioPython's DSSP wrapper which calls the external ``mkdssp``
+    binary.  Raises if mkdssp is not installed or fails.
     """
+    from Bio.PDB import PDBParser
+    from Bio.PDB.DSSP import DSSP
+
     region_names = ["helix", "sheet", "loop"]
     dssp_to_region = {
         "H": 0, "G": 0, "I": 0,   # helix family
@@ -124,30 +130,34 @@ def _label_protein_regions(universe, atom_indices) -> tuple[np.ndarray, list[str
     n = len(ag)
     labels = np.full(n, 2, dtype=np.int32)  # default = loop
 
+    # Parse structure with BioPython solely for DSSP assignment.
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("mol", str(pdb_path))
+    model = structure[0]
+
     try:
-        from MDAnalysis.analysis.dssp import DSSP
-        dssp = DSSP(universe).run()
-        # dssp.results.dssp gives per-residue assignment as a string for each frame
-        # We use frame 0 (only frame for a PDB).
-        dssp_string = dssp.results.dssp[0]  # one char per residue in the whole universe
+        dssp = DSSP(model, str(pdb_path), dssp="mkdssp")
+    except FileNotFoundError:
+        raise RuntimeError(
+            "mkdssp binary not found. Install it with: "
+            "conda install -c conda-forge dssp   OR   "
+            "apt-get install dssp"
+        )
+    except Exception as exc:
+        raise RuntimeError(f"mkdssp failed on {pdb_path.name}: {exc}") from exc
 
-        # Build residue-index -> DSSP code mapping for residues in selection
-        all_resids = list(universe.residues.resids)
-        all_segids = list(universe.residues.segids)
+    # Build lookup: (chain_id, resid) -> DSSP code
+    res_dssp: dict[tuple[str, int], str] = {}
+    for dssp_key in dssp.keys():
+        chain_id, res_tuple = dssp_key
+        resseq = res_tuple[1]
+        ss_code = dssp[dssp_key][2]  # secondary structure code
+        res_dssp[(chain_id, resseq)] = ss_code
 
-        # Map (segid, resid) -> dssp code
-        res_dssp = {}
-        for idx, res in enumerate(universe.residues):
-            if idx < len(dssp_string):
-                res_dssp[(res.segid, res.resid)] = dssp_string[idx]
-
-        for i, atom in enumerate(ag):
-            code = res_dssp.get((atom.segid, atom.resid), "-")
-            labels[i] = dssp_to_region.get(code, 2)
-
-    except Exception:
-        # DSSP not available or failed -- everything stays as loop (2)
-        pass
+    for i, atom in enumerate(ag):
+        # MDAnalysis segid corresponds to BioPython chain_id
+        code = res_dssp.get((atom.segid, atom.resid), "-")
+        labels[i] = dssp_to_region.get(code, 2)
 
     return labels, region_names
 
@@ -274,12 +284,17 @@ def load_molecule(pdb_path: Path) -> MoleculeData:
 
     if mol_type == "protein":
         region_labels, region_names = _label_protein_regions(
-            u, ag.indices
+            pdb_path, u, ag.indices,
         )
     elif mol_type == "nucleic_acid":
         region_labels, region_names = _label_nucleic_regions(atom_names)
     else:
         region_labels, region_names = _label_small_molecule(len(ag))
+
+    region_counts = {
+        name: int((region_labels == i).sum())
+        for i, name in enumerate(region_names)
+    }
 
     return MoleculeData(
         name=pdb_id,
@@ -290,4 +305,5 @@ def load_molecule(pdb_path: Path) -> MoleculeData:
         region_labels=region_labels,
         region_names=region_names,
         mol_type=mol_type,
+        region_counts=region_counts,
     )

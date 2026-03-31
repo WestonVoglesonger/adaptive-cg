@@ -13,6 +13,8 @@ authors = [
 ]
 keywords = ["molecular-dynamics", "coarse-graining", "structural-biology"]
 
+# System dependency: mkdssp binary required for DSSP secondary structure assignment.
+# Install via: conda install -c conda-forge dssp  OR  apt-get install dssp
 dependencies = [
     "numpy>=1.24.0",
     "scipy>=1.10.0",

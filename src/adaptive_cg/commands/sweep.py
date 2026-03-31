@@ -194,10 +194,11 @@ def execute(args):
         # Print summary line
         var_str = f"var={variable_result['best_rmse']:.4f}" if has_variable else "var=N/A"
         opt_str = f"opt={opt_result['rmse']:.4f}" if opt_result else ""
+        region_str = " ".join(f"{k}={v}" for k, v in mol.region_counts.items())
         print(
             f"{mol.n_atoms} atoms, {mol.mol_type}, "
             f"uni={best_uniform['rmse']:.4f}, {var_str} "
-            f"{opt_str}"
+            f"{opt_str} [{region_str}]"
         )
 
         # Save per-molecule JSON

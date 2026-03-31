@@ -13,6 +13,7 @@ __version__ = "0.1.0"
 def main():
     from adaptive_cg.commands import (
         fetch, evaluate, optimize, sweep, analyze, pareto, list_molecules,
+        conformer, region_breakdown,
     )
 
     parser = argparse.ArgumentParser(
@@ -28,6 +29,8 @@ Examples:
   acg sweep                               # Run Phase 1 across all molecules
   acg analyze                             # Aggregate results, statistics, plots
   acg pareto                              # Phase 2 Pareto frontier curves
+  acg conformer                            # Exp 2: multi-conformer NMR validation
+  acg region-breakdown                    # Exp 3: per-region RMSE breakdown
         """,
     )
 
@@ -41,6 +44,8 @@ Examples:
         "sweep":    (sweep,           "Run evaluation across all molecules (Phase 1)"),
         "analyze":  (analyze,         "Aggregate results, statistics, and plots"),
         "pareto":   (pareto,          "Generate Pareto frontier curves (Phase 2)"),
+        "conformer": (conformer, "Multi-conformer NMR ensemble validation (Exp 2)"),
+        "region-breakdown": (region_breakdown, "Per-region RMSE breakdown (Exp 3)"),
     }
 
     for name, (module, help_text) in commands.items():

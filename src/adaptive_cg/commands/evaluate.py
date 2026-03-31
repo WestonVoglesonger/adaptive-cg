@@ -58,7 +58,9 @@ def execute(args):
         return 1
 
     mol = load_molecule(pdb_file)
+    region_str = ", ".join(f"{k}: {v}" for k, v in mol.region_counts.items())
     print(f"Loaded {mol}")
+    print(f"  Region distribution: {region_str}")
 
     # ------------------------------------------------------------------
     # Uniform baselines
