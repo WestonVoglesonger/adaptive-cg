@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adaptive-cg"
+version = "0.1.0"
+description = "Adaptive Resolution Coarse-Graining: Variable Atom-to-Bead Ratio Validation"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Weston Voglesonger"}
+]
+keywords = ["molecular-dynamics", "coarse-graining", "structural-biology"]
+
+dependencies = [
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "MDAnalysis>=2.5.0",
+    "biopython>=1.81",
+    "matplotlib>=3.7.0",
+    "tqdm>=4.64.0",
+]
+
+[project.optional-dependencies]
+optimize = [
+    "torch>=2.0.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+acg = "adaptive_cg:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["adaptive_cg*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
