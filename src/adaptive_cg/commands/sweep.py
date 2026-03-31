@@ -90,6 +90,20 @@ def execute(args):
     summary_rows = []
     n_success, n_fail = 0, 0
 
+    # Prepare CSV for incremental writes (survives kill/crash).
+    csv_file = output_dir / "sweep_summary.csv"
+    csv_fieldnames = [
+        "pdb_id", "mol_type", "n_atoms", "n_regions", "region_names",
+        "best_uniform_ratio", "best_uniform_beads", "best_uniform_rmse",
+        "best_uniform_mae", "variable_rmse", "variable_ratios",
+        "variable_beads", "improvement_nm", "improvement_pct",
+        "optimize_rmse", "optimize_beads",
+    ]
+    csv_fh = open(csv_file, "w", newline="")
+    csv_writer = csv.DictWriter(csv_fh, fieldnames=csv_fieldnames)
+    csv_writer.writeheader()
+    csv_fh.flush()
+
     for i, pdb_file in enumerate(pdb_files, 1):
         pdb_id = pdb_file.stem.upper()
         print(f"[{i}/{len(pdb_files)}] {pdb_id} ... ", end="", flush=True)
@@ -112,7 +126,9 @@ def execute(args):
         best_uniform = min(uniform_results, key=lambda r: r["rmse"])
 
         # -- Variable mapping --
+        # Scale tolerance with molecule size so larger molecules still find configs.
         target_beads = best_uniform["n_beads"]
+        tol = max(3, target_beads // 10)
         variable_result = grid_search_variable(
             mol.positions,
             mol.masses,
@@ -120,6 +136,7 @@ def execute(args):
             mol.region_names,
             ratio_range=tuple(args.grid_ratio_range),
             target_beads=target_beads,
+            tolerance=tol,
         )
 
         has_variable = variable_result["best_rmse"] < float("inf")
@@ -228,26 +245,24 @@ def execute(args):
         with open(mol_dir / "evaluate_result.json", "w") as f:
             json.dump(mol_result, f, indent=2)
 
+        # Write row to CSV incrementally so results survive crashes.
+        csv_writer.writerow(row)
+        csv_fh.flush()
+
         # Free memory between molecules to avoid OOM on constrained machines.
         del mol, uniform_results, variable_result, opt_result, mol_result
         gc.collect()
 
+    csv_fh.close()
+
     # ------------------------------------------------------------------
-    # Write summary CSV
+    # Write summary JSON
     # ------------------------------------------------------------------
     if summary_rows:
-        csv_file = output_dir / "sweep_summary.csv"
-        fieldnames = list(summary_rows[0].keys())
-        with open(csv_file, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(summary_rows)
-        print(f"\nSummary CSV: {csv_file}")
-
-        # Also write summary JSON
         json_file = output_dir / "sweep_summary.json"
         with open(json_file, "w") as f:
             json.dump(summary_rows, f, indent=2, default=str)
+        print(f"\nSummary CSV: {csv_file}")
         print(f"Summary JSON: {json_file}")
 
     # ------------------------------------------------------------------

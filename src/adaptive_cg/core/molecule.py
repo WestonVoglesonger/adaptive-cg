@@ -251,6 +251,17 @@ def load_molecule(pdb_path: Path) -> MoleculeData:
     # ------------------------------------------------------------------
     positions = ag.positions / 10.0  # Angstroms -> nm
     masses = ag.masses.copy()
+
+    # Filter out atoms with zero mass (e.g. unknown elements in some PDBs).
+    nonzero = masses > 0
+    if not nonzero.all():
+        n_bad = (~nonzero).sum()
+        positions = positions[nonzero]
+        masses = masses[nonzero]
+        # Rebuild ag for downstream use (residue names, atom names, etc.)
+        ag = ag[nonzero]
+        if len(ag) == 0:
+            raise ValueError(f"All atoms have zero mass in {pdb_path}")
     elements = [atom.element.strip() if atom.element else atom.name.strip()[0]
                 for atom in ag]
     residue_names = [atom.resname.strip() for atom in ag]
