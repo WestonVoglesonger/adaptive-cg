@@ -386,6 +386,93 @@ def minimize_energy(
     return energies["potential"]
 
 
+def compute_native_contacts(
+    atom_positions: np.ndarray,
+    cutoff: float = 0.60,
+) -> list[tuple[int, int]]:
+    """Compute native atom-atom contacts from reference structure.
+
+    Called once at startup. Returns list of (atom_i, atom_j) pairs
+    that are within cutoff in the reference PDB structure.
+    This contact list is a property of the molecule, not the mapping.
+    """
+    from scipy.spatial.distance import cdist
+    dmat = cdist(atom_positions, atom_positions)
+    contacts = []
+    n = len(atom_positions)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if dmat[i, j] < cutoff:
+                contacts.append((i, j))
+    return contacts
+
+
+def project_contacts_to_beads(
+    native_contacts: list[tuple[int, int]],
+    mapping: list[list[int]],
+    ref_atom_positions: np.ndarray,
+    atom_masses: np.ndarray,
+    bond_list: list,
+    base_epsilon: float = 5.0,
+    max_epsilon: float = 15.0,
+) -> tuple[list[tuple[int, int]], list['LJParam']]:
+    """Project atom-level contacts to bead-level Go contacts.
+
+    For each pair of beads, counts how many native atom contacts exist
+    between their constituent atoms. More shared contacts = stronger
+    Go attraction. Reference distance from PDB bead COM positions.
+
+    This is O(n_contacts) — just integer lookups, microseconds.
+    """
+    n_atoms = len(ref_atom_positions)
+    n_beads = len(mapping)
+
+    # Build atom → bead lookup
+    atom_to_bead = np.full(n_atoms, -1, dtype=int)
+    for bead_idx, group in enumerate(mapping):
+        for a in group:
+            atom_to_bead[a] = bead_idx
+
+    # Count contacts per bead pair
+    from collections import Counter
+    pair_counts = Counter()
+    for a, b in native_contacts:
+        bi = atom_to_bead[a]
+        bj = atom_to_bead[b]
+        if bi < 0 or bj < 0 or bi == bj:
+            continue
+        pair = (min(bi, bj), max(bi, bj))
+        pair_counts[pair] += 1
+
+    # Exclude directly bonded bead pairs
+    bonded = {(min(i, j), max(i, j)) for i, j in bond_list}
+
+    # Compute reference bead COM positions
+    bead_com = np.zeros((n_beads, 3))
+    for i, group in enumerate(mapping):
+        grp = np.asarray(group)
+        m = atom_masses[grp]
+        bead_com[i] = (m[:, None] * ref_atom_positions[grp]).sum(axis=0) / m.sum()
+
+    # Create Go contacts scaled by contact count
+    max_count = max(pair_counts.values()) if pair_counts else 1
+    go_pairs = []
+    go_params = []
+    for (bi, bj), count in pair_counts.items():
+        if (bi, bj) in bonded:
+            continue
+        r0 = np.linalg.norm(bead_com[bi] - bead_com[bj])
+        if r0 < 1e-6:
+            continue
+        sigma = r0 / (2.0 ** (1.0 / 6.0))
+        # Scale epsilon by fraction of max contacts
+        eps = base_epsilon + (max_epsilon - base_epsilon) * (count / max_count)
+        go_pairs.append((bi, bj))
+        go_params.append(LJParam(sigma=sigma, epsilon=eps))
+
+    return go_pairs, go_params
+
+
 def _add_structure_bias(
     positions: np.ndarray,
     bond_list: list,
@@ -396,40 +483,30 @@ def _add_structure_bias(
     mode: str = "none",
     en_cutoff: float = 0.9,
     en_k: float = 500.0,
-    go_cutoff: float = 0.9,
-    go_epsilon: float = 10.0,
+    native_contacts: list[tuple[int, int]] | None = None,
+    mapping: list[list[int]] | None = None,
+    ref_atom_positions: np.ndarray | None = None,
+    atom_masses: np.ndarray | None = None,
     verbose: bool = True,
 ) -> None:
     """Add structure bias to prevent entropy-driven unfolding.
 
-    The Boltzmann-inverted CG potentials are free energies (PMF),
-    not internal energies. Running MD with PMFs double-counts entropy,
-    causing proteins to unfold. Structure bias compensates by adding
-    restraints based on the native (reference) structure.
-
     Modes:
     - 'elastic': Harmonic springs between nearby beads (ElNeDyn).
-      Rigid, prevents unfolding. Good for structure preservation.
-    - 'go': LJ contacts between native contacts.
-      Flexible, contacts can break. Good for adaptive resolution.
+    - 'go': Atom-level native contacts projected to bead-level LJ.
+      Consistent across remaps because atom contacts are fixed.
     - 'none': No bias.
-
-    Modifies bond_list/bond_params (elastic) or nb_pairs/nb_params (go)
-    in-place.
     """
     if mode == "none":
         return
 
-    n = positions.shape[0]
-    from scipy.spatial.distance import cdist
-    dmat = cdist(positions, positions)
     n_added = 0
 
     if mode == "elastic":
-        # Add harmonic springs between all pairs within cutoff,
-        # excluding already-bonded pairs (1-2) and 1-3 neighbors
-        for i in range(n):
-            for j in range(i + 1, n):
+        from scipy.spatial.distance import cdist
+        dmat = cdist(positions, positions)
+        for i in range(positions.shape[0]):
+            for j in range(i + 1, positions.shape[0]):
                 if (i, j) in exclude_set:
                     continue
                 r0 = dmat[i, j]
@@ -439,25 +516,21 @@ def _add_structure_bias(
                     n_added += 1
 
     elif mode == "go":
-        # Add attractive LJ contacts between native contact pairs.
-        # sigma = r0 / 2^(1/6) so the LJ minimum is at r0.
-        # Only exclude direct bonds (1-2), NOT 1-3/1-4 — those provide
-        # critical local structure since dihedrals are scaled down.
-        bonded_only = {(min(b[0],b[1]), max(b[0],b[1])) for b in bond_list}
-        for i in range(n):
-            for j in range(i + 1, n):
-                if (i, j) in bonded_only:
-                    continue
-                r0 = dmat[i, j]
-                if r0 < go_cutoff:
-                    sigma = r0 / (2.0 ** (1.0 / 6.0))
-                    nb_pairs.append((i, j))
-                    nb_params.append(LJParam(sigma=sigma, epsilon=go_epsilon))
-                    n_added += 1
+        if native_contacts is None or mapping is None or ref_atom_positions is None:
+            raise ValueError(
+                "Go contacts require native_contacts, mapping, "
+                "ref_atom_positions, and atom_masses"
+            )
+        go_pairs, go_params = project_contacts_to_beads(
+            native_contacts, mapping, ref_atom_positions,
+            atom_masses, bond_list,
+        )
+        nb_pairs.extend(go_pairs)
+        nb_params.extend(go_params)
+        n_added = len(go_pairs)
 
     if verbose and n_added > 0:
-        print(f"  Structure bias ({mode}): {n_added} contacts, "
-              f"cutoff={en_cutoff if mode == 'elastic' else go_cutoff} nm")
+        print(f"  Structure bias ({mode}): {n_added} contacts")
 
 
 def setup_cg_system(
@@ -679,10 +752,19 @@ def setup_cg_system(
                   f"{n_nb_missing} non-bonded")
 
     # Structure bias (elastic network or Go contacts)
+    native_contacts = None
+    if structure_bias == "go":
+        native_contacts = compute_native_contacts(atom_positions)
+        if verbose:
+            print(f"  Native atom contacts: {len(native_contacts)}")
     _add_structure_bias(
         bead_positions, bond_list, bond_params,
         nb_pairs, nb_params_list, exclude_set,
         mode=structure_bias, verbose=verbose,
+        native_contacts=native_contacts,
+        mapping=mapping,
+        ref_atom_positions=atom_positions,
+        atom_masses=atom_masses,
     )
 
     # Initialize velocities (Maxwell-Boltzmann)
