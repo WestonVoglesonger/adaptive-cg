@@ -14,6 +14,7 @@ def main():
     from adaptive_cg.commands import (
         fetch, evaluate, optimize, sweep, analyze, pareto, list_molecules,
         conformer, region_breakdown, compare_optimizers, simulate,
+        extract, parameterize,
     )
 
     parser = argparse.ArgumentParser(
@@ -34,6 +35,8 @@ Examples:
   acg compare                             # Benchmark all strategies head-to-head
   acg simulate 1UBQ                       # Run all-atom MD (generates reference data)
   acg simulate 1UBQ --steps 5000000       # Longer run (10 ns)
+  acg extract 1UBQ                        # Extract CG distributions from trajectory
+  acg parameterize                        # Derive CG force field from all extractions
         """,
     )
 
@@ -51,6 +54,8 @@ Examples:
         "region-breakdown": (region_breakdown, "Per-region RMSE breakdown (Exp 3)"),
         "compare": (compare_optimizers, "Compare optimization strategies head-to-head"),
         "simulate": (simulate, "Run all-atom MD simulation (OpenMM)"),
+        "extract": (extract, "Extract CG distributions from AA trajectory"),
+        "parameterize": (parameterize, "Derive transferable CG force field"),
     }
 
     for name, (module, help_text) in commands.items():
