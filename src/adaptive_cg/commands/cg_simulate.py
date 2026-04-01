@@ -56,6 +56,10 @@ def setup_parser(parser: argparse.ArgumentParser):
         help="Scale dihedral force constants (default: 1.0)",
     )
     parser.add_argument(
+        "--structure-bias", choices=["none", "elastic", "go"], default="none",
+        help="Structure bias to prevent unfolding (default: none)",
+    )
+    parser.add_argument(
         "--log-interval", type=int, default=100,
         help="Log energies every N steps (default: 100)",
     )
@@ -113,6 +117,7 @@ def execute(args: argparse.Namespace) -> int:
         bond_scale=args.bond_scale,
         angle_scale=args.angle_scale,
         dihedral_scale=args.dihedral_scale,
+        structure_bias=args.structure_bias,
         verbose=True,
     )
 

@@ -234,6 +234,7 @@ def remap_system(
     ff: dict,
     temperature: float = 300.0,
     dihedral_scale: float = 1.0,
+    structure_bias: str = "none",
 ) -> tuple[CGSystem, list[list[int]]]:
     """Create a new CGSystem with per-region bead allocation.
 
@@ -347,6 +348,14 @@ def remap_system(
             nb_pairs.append((i, j))
             nb_params.append(LJParam(sigma=sigma_ij, epsilon=eps))
 
+    # Structure bias (Go contacts or elastic network)
+    from adaptive_cg.core.engine import _add_structure_bias, BondParam
+    _add_structure_bias(
+        bead_positions, bond_list, bond_params,
+        nb_pairs, nb_params, exclude_set,
+        mode=structure_bias,
+    )
+
     # Initialize velocities (Maxwell-Boltzmann)
     velocities = np.zeros((n_beads, 3))
     for i in range(n_beads):
@@ -430,6 +439,7 @@ def run_adaptive_simulation(
     activity_weight: float = 0.5,
     monitor_window: int = 50,
     dihedral_scale: float = 1.0,
+    structure_bias: str = "none",
     log_interval: int = 100,
     save_interval: int = 1000,
     trajectory_path: Path | None = None,
@@ -547,7 +557,7 @@ def run_adaptive_simulation(
     # --- Build initial system ---
     system, mapping = remap_system(
         original_atoms, atom_masses, elements, atom_names, residue_names,
-        mol_type, regions, current_alloc, ff, temperature, dihedral_scale,
+        mol_type, regions, current_alloc, ff, temperature, dihedral_scale, structure_bias,
     )
 
     if verbose:
@@ -630,7 +640,7 @@ def run_adaptive_simulation(
                 system, mapping = remap_system(
                     est_atoms, atom_masses, elements, atom_names,
                     residue_names, mol_type, regions, proposed,
-                    ff, temperature, dihedral_scale,
+                    ff, temperature, dihedral_scale, structure_bias,
                 )
                 current_alloc = proposed.copy()
 

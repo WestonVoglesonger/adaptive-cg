@@ -386,6 +386,80 @@ def minimize_energy(
     return energies["potential"]
 
 
+def _add_structure_bias(
+    positions: np.ndarray,
+    bond_list: list,
+    bond_params: list,
+    nb_pairs: list,
+    nb_params: list,
+    exclude_set: set,
+    mode: str = "none",
+    en_cutoff: float = 0.9,
+    en_k: float = 500.0,
+    go_cutoff: float = 0.9,
+    go_epsilon: float = 10.0,
+    verbose: bool = True,
+) -> None:
+    """Add structure bias to prevent entropy-driven unfolding.
+
+    The Boltzmann-inverted CG potentials are free energies (PMF),
+    not internal energies. Running MD with PMFs double-counts entropy,
+    causing proteins to unfold. Structure bias compensates by adding
+    restraints based on the native (reference) structure.
+
+    Modes:
+    - 'elastic': Harmonic springs between nearby beads (ElNeDyn).
+      Rigid, prevents unfolding. Good for structure preservation.
+    - 'go': LJ contacts between native contacts.
+      Flexible, contacts can break. Good for adaptive resolution.
+    - 'none': No bias.
+
+    Modifies bond_list/bond_params (elastic) or nb_pairs/nb_params (go)
+    in-place.
+    """
+    if mode == "none":
+        return
+
+    n = positions.shape[0]
+    from scipy.spatial.distance import cdist
+    dmat = cdist(positions, positions)
+    n_added = 0
+
+    if mode == "elastic":
+        # Add harmonic springs between all pairs within cutoff,
+        # excluding already-bonded pairs (1-2) and 1-3 neighbors
+        for i in range(n):
+            for j in range(i + 1, n):
+                if (i, j) in exclude_set:
+                    continue
+                r0 = dmat[i, j]
+                if r0 < en_cutoff:
+                    bond_list.append((i, j))
+                    bond_params.append(BondParam(r0=r0, k=en_k))
+                    n_added += 1
+
+    elif mode == "go":
+        # Add attractive LJ contacts between native contact pairs.
+        # sigma = r0 / 2^(1/6) so the LJ minimum is at r0.
+        # Only exclude direct bonds (1-2), NOT 1-3/1-4 — those provide
+        # critical local structure since dihedrals are scaled down.
+        bonded_only = {(min(b[0],b[1]), max(b[0],b[1])) for b in bond_list}
+        for i in range(n):
+            for j in range(i + 1, n):
+                if (i, j) in bonded_only:
+                    continue
+                r0 = dmat[i, j]
+                if r0 < go_cutoff:
+                    sigma = r0 / (2.0 ** (1.0 / 6.0))
+                    nb_pairs.append((i, j))
+                    nb_params.append(LJParam(sigma=sigma, epsilon=go_epsilon))
+                    n_added += 1
+
+    if verbose and n_added > 0:
+        print(f"  Structure bias ({mode}): {n_added} contacts, "
+              f"cutoff={en_cutoff if mode == 'elastic' else go_cutoff} nm")
+
+
 def setup_cg_system(
     pdb_path: Path,
     ff_path: Path,
@@ -395,6 +469,7 @@ def setup_cg_system(
     bond_scale: float = 1.0,
     angle_scale: float = 1.0,
     dihedral_scale: float = 1.0,
+    structure_bias: str = "none",
     verbose: bool = True,
 ) -> CGSystem:
     """Set up a CG system from a PDB file and force field.
@@ -602,6 +677,13 @@ def setup_cg_system(
             print(f"  Missing: {n_bond_missing} bonds, "
                   f"{n_angle_missing} angles, {n_dih_missing} dihedrals, "
                   f"{n_nb_missing} non-bonded")
+
+    # Structure bias (elastic network or Go contacts)
+    _add_structure_bias(
+        bead_positions, bond_list, bond_params,
+        nb_pairs, nb_params_list, exclude_set,
+        mode=structure_bias, verbose=verbose,
+    )
 
     # Initialize velocities (Maxwell-Boltzmann)
     velocities = np.zeros((n_beads, 3))
