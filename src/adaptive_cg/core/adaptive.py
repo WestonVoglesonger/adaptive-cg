@@ -233,6 +233,7 @@ def remap_system(
     allocation: np.ndarray,
     ff: dict,
     temperature: float = 300.0,
+    dihedral_scale: float = 1.0,
 ) -> tuple[CGSystem, list[list[int]]]:
     """Create a new CGSystem with per-region bead allocation.
 
@@ -310,12 +311,10 @@ def remap_system(
     for i, j, k, l in dihedrals:
         key = "--".join([bead_keys[i], bead_keys[j], bead_keys[k], bead_keys[l]])
         key_rev = "--".join([bead_keys[l], bead_keys[k], bead_keys[j], bead_keys[i]])
-        if key in ff.get("dihedrals", {}):
+        p = ff.get("dihedrals", {}).get(key) or ff.get("dihedrals", {}).get(key_rev)
+        if p:
             dihedral_list.append((i, j, k, l))
-            dihedral_params.append(ff["dihedrals"][key])
-        elif key_rev in ff.get("dihedrals", {}):
-            dihedral_list.append((i, j, k, l))
-            dihedral_params.append(ff["dihedrals"][key_rev])
+            dihedral_params.append(DihedralParam(phi0=p.phi0, k=p.k * dihedral_scale, n=p.n))
 
     # Non-bonded exclusions: 1-2, 1-3, 1-4
     neighbors = defaultdict(set)
@@ -430,6 +429,7 @@ def run_adaptive_simulation(
     remap_threshold: int = 3,
     activity_weight: float = 0.5,
     monitor_window: int = 50,
+    dihedral_scale: float = 1.0,
     log_interval: int = 100,
     save_interval: int = 1000,
     trajectory_path: Path | None = None,
@@ -547,7 +547,7 @@ def run_adaptive_simulation(
     # --- Build initial system ---
     system, mapping = remap_system(
         original_atoms, atom_masses, elements, atom_names, residue_names,
-        mol_type, regions, current_alloc, ff, temperature,
+        mol_type, regions, current_alloc, ff, temperature, dihedral_scale,
     )
 
     if verbose:
@@ -630,7 +630,7 @@ def run_adaptive_simulation(
                 system, mapping = remap_system(
                     est_atoms, atom_masses, elements, atom_names,
                     residue_names, mol_type, regions, proposed,
-                    ff, temperature,
+                    ff, temperature, dihedral_scale,
                 )
                 current_alloc = proposed.copy()
 

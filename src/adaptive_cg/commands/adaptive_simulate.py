@@ -67,6 +67,11 @@ def setup_parser(parser: argparse.ArgumentParser):
         "--monitor-window", type=int, default=50,
         help="Sliding window size for RMSF (default: 50)",
     )
+    # Force field scaling
+    parser.add_argument(
+        "--dihedral-scale", type=float, default=1.0,
+        help="Scale dihedral force constants (default: 1.0)",
+    )
     # Logging
     parser.add_argument(
         "--log-interval", type=int, default=100,
@@ -135,6 +140,7 @@ def execute(args: argparse.Namespace) -> int:
         remap_threshold=args.remap_threshold,
         activity_weight=args.activity_weight,
         monitor_window=args.monitor_window,
+        dihedral_scale=args.dihedral_scale,
         log_interval=args.log_interval,
         save_interval=args.save_interval,
         trajectory_path=traj_path,
