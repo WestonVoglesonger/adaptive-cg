@@ -235,6 +235,7 @@ def remap_system(
     temperature: float = 300.0,
     dihedral_scale: float = 1.0,
     structure_bias: str = "none",
+    reference_atom_positions: np.ndarray | None = None,
 ) -> tuple[CGSystem, list[list[int]]]:
     """Create a new CGSystem with per-region bead allocation.
 
@@ -349,9 +350,15 @@ def remap_system(
             nb_params.append(LJParam(sigma=sigma_ij, epsilon=eps))
 
     # Structure bias (Go contacts or elastic network)
+    # Use reference (PDB) atom positions for native contacts, not current
     from adaptive_cg.core.engine import _add_structure_bias, BondParam
+    if reference_atom_positions is not None:
+        from adaptive_cg.core.extract import compute_bead_positions as _cbp
+        ref_bead_pos = _cbp(global_mapping, reference_atom_positions, atom_masses)
+    else:
+        ref_bead_pos = bead_positions
     _add_structure_bias(
-        bead_positions, bond_list, bond_params,
+        ref_bead_pos, bond_list, bond_params,
         nb_pairs, nb_params, exclude_set,
         mode=structure_bias,
     )
@@ -557,7 +564,7 @@ def run_adaptive_simulation(
     # --- Build initial system ---
     system, mapping = remap_system(
         original_atoms, atom_masses, elements, atom_names, residue_names,
-        mol_type, regions, current_alloc, ff, temperature, dihedral_scale, structure_bias,
+        mol_type, regions, current_alloc, ff, temperature, dihedral_scale, structure_bias, original_atoms,
     )
 
     if verbose:
@@ -640,7 +647,7 @@ def run_adaptive_simulation(
                 system, mapping = remap_system(
                     est_atoms, atom_masses, elements, atom_names,
                     residue_names, mol_type, regions, proposed,
-                    ff, temperature, dihedral_scale, structure_bias,
+                    ff, temperature, dihedral_scale, structure_bias, original_atoms,
                 )
                 current_alloc = proposed.copy()
 
