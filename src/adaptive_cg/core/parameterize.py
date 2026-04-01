@@ -145,21 +145,28 @@ def boltzmann_invert_harmonic(
     def harmonic(x, k, x0):
         return k * (x - x0) ** 2
 
+    # Fallback values from distribution statistics
+    x0_fallback = float(np.mean(samples))
+    variance = float(np.var(samples))
+    k_fallback = kbt / variance if variance > 1e-12 else 1000.0
+
     try:
         # Initial guess: x0 = peak of distribution, k from variance
         x0_guess = x[np.argmin(pmf)]
-        k_guess = kbt / (np.var(samples) + 1e-12)
+        k_guess = kbt / (variance + 1e-12)
         popt, _ = curve_fit(harmonic, x, pmf, p0=[k_guess, x0_guess], maxfev=5000)
-        k_fit, x0_fit = popt
-        # Force constants must be positive
-        k_fit = abs(k_fit)
-    except (RuntimeError, ValueError):
-        # Fallback: use distribution statistics
-        x0_fit = float(np.mean(samples))
-        variance = float(np.var(samples))
-        k_fit = kbt / variance if variance > 1e-12 else 1000.0
+        k_fit, x0_fit = float(abs(popt[0])), float(popt[1])
 
-    return HarmonicParams(x0=float(x0_fit), k=float(k_fit), n_samples=n_samples)
+        # Sanity check: reject nonsense fits
+        sample_min, sample_max = float(np.min(samples)), float(np.max(samples))
+        if x0_fit < sample_min - (sample_max - sample_min) or \
+           x0_fit > sample_max + (sample_max - sample_min) or \
+           k_fit < 1e-3:
+            x0_fit, k_fit = x0_fallback, k_fallback
+    except (RuntimeError, ValueError):
+        x0_fit, k_fit = x0_fallback, k_fallback
+
+    return HarmonicParams(x0=x0_fit, k=k_fit, n_samples=n_samples)
 
 
 def derive_lj_from_rdf(
