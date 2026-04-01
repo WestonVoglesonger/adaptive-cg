@@ -304,8 +304,11 @@ def minimize_energy(
             scale = np.where(too_large, force_cap / force_norms, 1.0)
             forces *= scale[:, None]
 
-        # Steepest descent step
-        system.positions += step_size * forces / (force_norms.max() + 1e-12)
+        # Steepest descent step: normalize force direction, fixed step size
+        for bi in range(system.n_beads):
+            fn = force_norms[bi]
+            if fn > 1e-12:
+                system.positions[bi] += step_size * forces[bi] / fn
 
         if verbose and (step + 1) % 200 == 0:
             print(f"  Step {step+1}: PE={energies['potential']:.1f}, "
@@ -451,14 +454,29 @@ def setup_cg_system(
         else:
             n_angle_missing += 1
 
-    # Non-bonded pairs: exclude 1-2 (bonds) and 1-3 (angle partners)
-    # Without these exclusions, nearby beads in a folded protein get
-    # enormous LJ repulsion because they're closer than sigma.
-    exclude_set = set()
+    # Non-bonded pairs: exclude 1-2, 1-3, and 1-4 neighbors.
+    # In a linear chain of beads, neighbors up to 4 bonds apart are
+    # close by construction and their interactions are already captured
+    # by bond/angle/dihedral terms. LJ on these causes blowup.
+    from collections import defaultdict
+    neighbors = defaultdict(set)
     for i, j in bonds:
-        exclude_set.add((min(i, j), max(i, j)))
-    for i, j, k in angles:
-        exclude_set.add((min(i, k), max(i, k)))
+        neighbors[i].add(j)
+        neighbors[j].add(i)
+
+    exclude_set = set()
+    for i in range(n_beads):
+        # 1-2: direct bond partners
+        for j in neighbors[i]:
+            exclude_set.add((min(i, j), max(i, j)))
+            # 1-3: partners of partners
+            for k in neighbors[j]:
+                if k != i:
+                    exclude_set.add((min(i, k), max(i, k)))
+                    # 1-4: one more hop
+                    for l in neighbors[k]:
+                        if l != i and l != j:
+                            exclude_set.add((min(i, l), max(i, l)))
 
     nb_pairs = []
     nb_params_list = []
@@ -701,7 +719,7 @@ def run_cg_simulation(
     frames = []
 
     # Energy minimization before MD
-    minimize_energy(system, max_steps=2000, verbose=verbose)
+    minimize_energy(system, max_steps=5000, step_size=0.001, verbose=verbose)
 
     # Re-initialize velocities after minimization (positions changed)
     for i in range(system.n_beads):
