@@ -105,6 +105,25 @@ def _correlate(a: np.ndarray, b: np.ndarray) -> float:
     return float(max(0.0, corr))
 
 
+def _aa_to_cg_positions(aa_positions: np.ndarray, n_beads: int) -> np.ndarray:
+    """Project AA atom positions to CG bead resolution via k-means.
+
+    Returns bead COM positions with the same bead count as the CG system,
+    so contact maps are directly comparable.
+    """
+    from adaptive_cg.core.strategies import kmeans_mapping
+
+    # Use uniform masses for COM (we don't have AA masses here)
+    masses = np.ones(len(aa_positions))
+    mapping = kmeans_mapping(aa_positions, masses, n_beads)
+    n_actual = len(mapping)
+
+    bead_pos = np.empty((n_actual, 3))
+    for i, group in enumerate(mapping):
+        bead_pos[i] = aa_positions[group].mean(axis=0)
+    return bead_pos
+
+
 def compute_quality(
     cg_positions: np.ndarray,
     cg_trajectory: np.ndarray | None,
@@ -114,25 +133,20 @@ def compute_quality(
 ) -> QualityMetrics:
     """Compute all quality metrics comparing CG to AA reference.
 
+    Projects AA positions to CG bead resolution via k-means so that
+    contact maps are directly comparable (same number of beads).
+
     Parameters
     ----------
     cg_positions : np.ndarray, shape (n_beads, 3)
-        Current CG bead positions in nm.
     cg_trajectory : np.ndarray or None, shape (n_frames, n_beads, 3)
-        CG trajectory frames. If None, RMSF correlation is set to 0.
     aa_positions : np.ndarray, shape (n_atoms, 3)
-        AA atom positions from PDB in nm.
     aa_trajectory : np.ndarray or None, shape (n_frames, n_atoms, 3)
-        AA trajectory frames. If None, RMSF correlation is set to 0.
     n_regions : int
-        Number of sequential regions for RMSF comparison.
 
     Returns
     -------
     QualityMetrics
-        Combined quality assessment. structural_quality is a weighted
-        mean of (1 - rg_deviation), contact_map_correlation, and
-        rmsf_correlation, clamped to [0, 1].
     """
     # --- Radius of gyration ---
     rg_cg = compute_rg(cg_positions)
@@ -140,10 +154,13 @@ def compute_quality(
     rg_deviation = abs(rg_cg - rg_aa) / rg_aa if rg_aa > 0 else 0.0
 
     # --- Contact map correlation ---
-    # CG and AA have different numbers of particles, so we compare the
-    # internal contact patterns of each (self-consistency of distances).
-    cg_contacts = compute_contact_map(cg_positions)
-    aa_contacts = compute_contact_map(aa_positions)
+    # Project AA to same bead count as CG so contact maps match
+    n_beads = cg_positions.shape[0]
+    aa_bead_positions = _aa_to_cg_positions(aa_positions, n_beads)
+    # After k-means merging, bead counts might differ slightly
+    n_compare = min(len(cg_positions), len(aa_bead_positions))
+    cg_contacts = compute_contact_map(cg_positions[:n_compare])
+    aa_contacts = compute_contact_map(aa_bead_positions[:n_compare])
     contact_corr = _correlate(cg_contacts, aa_contacts)
 
     # --- RMSF correlation ---
