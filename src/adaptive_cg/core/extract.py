@@ -246,13 +246,13 @@ class ExtractionResult:
 
         meta = {
             "molecule": self.molecule,
-            "n_frames": self.n_frames,
-            "n_beads": self.n_beads,
-            "n_atoms": self.n_atoms,
+            "n_frames": int(self.n_frames),
+            "n_beads": int(self.n_beads),
+            "n_atoms": int(self.n_atoms),
             "bead_classes": self.bead_classes,
             "bead_class_keys": self.bead_class_keys,
-            "bonds": self.bonds,
-            "angles": self.angles,
+            "bonds": [[int(x) for x in b] for b in self.bonds],
+            "angles": [[int(x) for x in a] for a in self.angles],
         }
         with open(output_dir / "meta.json", "w") as f:
             json.dump(meta, f, indent=2)
