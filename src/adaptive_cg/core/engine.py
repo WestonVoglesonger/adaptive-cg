@@ -247,6 +247,73 @@ class CGSystem:
         return 2.0 * ke / (n_dof * KB)
 
 
+def minimize_energy(
+    system: CGSystem,
+    max_steps: int = 1000,
+    step_size: float = 0.0001,
+    force_cap: float = 1000.0,
+    tolerance: float = 1.0,
+    verbose: bool = True,
+) -> float:
+    """Steepest descent energy minimization with force capping.
+
+    Moves beads along force direction with capped step size to
+    remove bad contacts before MD.
+
+    Parameters
+    ----------
+    system : CGSystem
+    max_steps : int
+        Maximum minimization steps.
+    step_size : float
+        Initial step size in nm.
+    force_cap : float
+        Maximum force magnitude per bead (kJ/mol/nm).
+    tolerance : float
+        Stop when max force < tolerance (kJ/mol/nm).
+    verbose : bool
+        Print progress.
+
+    Returns
+    -------
+    float : final potential energy
+    """
+    if verbose:
+        forces, energies = system.compute_forces()
+        print(f"Minimizing energy (initial PE={energies['potential']:.1f} kJ/mol)")
+
+    for step in range(max_steps):
+        forces, energies = system.compute_forces()
+
+        # Cap forces
+        force_norms = np.linalg.norm(forces, axis=1)
+        max_force = force_norms.max()
+
+        if max_force < tolerance:
+            if verbose:
+                print(f"  Converged at step {step}: "
+                      f"PE={energies['potential']:.1f}, max_F={max_force:.2f}")
+            return energies["potential"]
+
+        # Cap individual forces
+        too_large = force_norms > force_cap
+        if too_large.any():
+            scale = np.where(too_large, force_cap / force_norms, 1.0)
+            forces *= scale[:, None]
+
+        # Steepest descent step
+        system.positions += step_size * forces / (force_norms.max() + 1e-12)
+
+        if verbose and (step + 1) % 200 == 0:
+            print(f"  Step {step+1}: PE={energies['potential']:.1f}, "
+                  f"max_F={max_force:.1f}")
+
+    forces, energies = system.compute_forces()
+    if verbose:
+        print(f"  Finished {max_steps} steps: PE={energies['potential']:.1f}")
+    return energies["potential"]
+
+
 def setup_cg_system(
     pdb_path: Path,
     ff_path: Path,
@@ -622,6 +689,17 @@ def run_cg_simulation(
     """
     log = SimulationLog()
     frames = []
+
+    # Energy minimization before MD
+    minimize_energy(system, max_steps=2000, verbose=verbose)
+
+    # Re-initialize velocities after minimization (positions changed)
+    for i in range(system.n_beads):
+        sigma_v = np.sqrt(KB * temperature / system.masses[i])
+        system.velocities[i] = np.random.normal(0.0, sigma_v, size=3)
+    total_mass = system.masses.sum()
+    com_vel = (system.masses[:, None] * system.velocities).sum(axis=0) / total_mass
+    system.velocities -= com_vel
 
     # Initial forces
     forces, energies = system.compute_forces()
