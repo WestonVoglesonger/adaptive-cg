@@ -75,11 +75,54 @@ def _sort_clusters_by_mean_index(labels: np.ndarray, n_clusters: int) -> list[li
 # 1. K-means mapping
 # ---------------------------------------------------------------------------
 
+def _merge_small_clusters(
+    mapping: list[list[int]],
+    positions: np.ndarray,
+    min_atoms: int,
+) -> list[list[int]]:
+    """Merge clusters smaller than min_atoms into their nearest neighbor.
+
+    Small beads (2-3 atoms) cause LJ explosions because their sigma is
+    too small to provide adequate repulsion. Merging them into adjacent
+    clusters eliminates the problem at the source.
+    """
+    if min_atoms <= 1:
+        return mapping
+
+    result = [list(g) for g in mapping]
+    changed = True
+    while changed:
+        changed = False
+        # Compute centroids
+        centroids = np.array([positions[g].mean(axis=0) for g in result])
+        i = 0
+        while i < len(result):
+            if len(result[i]) < min_atoms and len(result) > 1:
+                # Find nearest neighbor cluster
+                dists = np.array([
+                    np.linalg.norm(centroids[i] - centroids[j])
+                    if j != i else np.inf
+                    for j in range(len(result))
+                ])
+                nearest = int(np.argmin(dists))
+                # Merge into nearest
+                result[nearest].extend(result[i])
+                result[nearest].sort()
+                result.pop(i)
+                centroids = np.array([positions[g].mean(axis=0) for g in result])
+                changed = True
+            else:
+                i += 1
+
+    return result
+
+
 def kmeans_mapping(
     positions: np.ndarray,
     masses: np.ndarray,
     n_beads: int,
     connectivity_weight: float = 0.5,
+    min_atoms: int = 4,
 ) -> list[list[int]]:
     """K-means clustering on atom positions with a connectivity penalty.
 
@@ -87,6 +130,9 @@ def kmeans_mapping(
     ``[x, y, z, seq_index * connectivity_weight]`` where
     ``seq_index = atom_index / n_atoms``.  The extra dimension encourages
     sequentially nearby atoms to land in the same cluster.
+
+    Clusters with fewer than min_atoms atoms are merged into their
+    nearest neighbor to prevent LJ instabilities from tiny beads.
 
     Parameters
     ----------
@@ -98,6 +144,8 @@ def kmeans_mapping(
         Number of CG beads (clusters).
     connectivity_weight : float
         Scaling factor for the sequential-index feature.
+    min_atoms : int
+        Minimum atoms per bead. Smaller clusters get merged (default: 4).
 
     Returns
     -------
@@ -114,7 +162,12 @@ def kmeans_mapping(
     km = KMeans(n_clusters=n_beads, n_init=10, random_state=42)
     labels = km.fit_predict(features)
 
-    return _sort_clusters_by_mean_index(labels, n_beads)
+    mapping = _sort_clusters_by_mean_index(labels, n_beads)
+
+    # Merge small clusters
+    mapping = _merge_small_clusters(mapping, positions, min_atoms)
+
+    return mapping
 
 
 # ---------------------------------------------------------------------------

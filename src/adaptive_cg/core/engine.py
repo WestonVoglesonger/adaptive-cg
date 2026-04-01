@@ -475,6 +475,7 @@ def setup_cg_system(
     if n_beads is None:
         n_beads = max(2, n_atoms // ratio)
     mapping = kmeans_mapping(atom_positions, atom_masses, n_beads)
+    n_beads = len(mapping)  # may be fewer after merging small clusters
     if verbose:
         sizes = [len(g) for g in mapping]
         print(f"Mapping: {len(mapping)} beads, "
