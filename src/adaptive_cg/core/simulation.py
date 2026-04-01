@@ -129,6 +129,11 @@ def run_aa_simulation(
         if verbose:
             print(f"  Removed {len(waters_to_delete)} crystal waters")
 
+    # Add missing hydrogens (PDB files typically lack them)
+    if verbose:
+        print("  Adding missing hydrogens")
+    modeller.addHydrogens(forcefield)
+
     modeller.addSolvent(
         forcefield,
         padding=config.padding * unit.nanometers,
