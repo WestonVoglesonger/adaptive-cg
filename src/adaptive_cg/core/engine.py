@@ -175,6 +175,9 @@ def compute_nonbonded_forces(
         if r < 1e-12 or r > cutoff:
             continue
 
+        # Soft minimum distance to prevent catastrophic forces
+        r = max(r, 0.5 * param.sigma)
+
         r_hat = rij / r
         sig_r = param.sigma / r
         sig_r6 = sig_r ** 6
@@ -448,14 +451,21 @@ def setup_cg_system(
         else:
             n_angle_missing += 1
 
-    # Non-bonded pairs (all pairs not in bond list)
-    bonded_set = set(bonds) | {(j, i) for i, j in bonds}
+    # Non-bonded pairs: exclude 1-2 (bonds) and 1-3 (angle partners)
+    # Without these exclusions, nearby beads in a folded protein get
+    # enormous LJ repulsion because they're closer than sigma.
+    exclude_set = set()
+    for i, j in bonds:
+        exclude_set.add((min(i, j), max(i, j)))
+    for i, j, k in angles:
+        exclude_set.add((min(i, k), max(i, k)))
+
     nb_pairs = []
     nb_params_list = []
     n_nb_missing = 0
     for i in range(n_beads):
         for j in range(i + 1, n_beads):
-            if (i, j) in bonded_set:
+            if (i, j) in exclude_set:
                 continue
             key = "--".join(sorted([bead_keys[i], bead_keys[j]]))
             if key in ff["nonbonded"]:
