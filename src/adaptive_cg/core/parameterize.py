@@ -30,6 +30,18 @@ class HarmonicParams:
 
 
 @dataclass
+class DihedralParams:
+    """Parameters for a periodic dihedral potential.
+
+    U = k * (1 + cos(n * phi - phi0))
+    """
+    phi0: float     # phase angle (radians)
+    k: float        # force constant (kJ/mol)
+    n: int          # multiplicity (periodicity)
+    n_samples: int
+
+
+@dataclass
 class CGForceField:
     """Transferable CG force field parameters."""
 
@@ -39,8 +51,10 @@ class CGForceField:
     # Angle params keyed by "classA--classB--classC"
     angle_params: dict[str, HarmonicParams]
 
+    # Dihedral params keyed by "classA--classB--classC--classD"
+    dihedral_params: dict[str, DihedralParams]
+
     # Non-bonded LJ params keyed by "classA--classB"
-    # Each has (sigma, epsilon) — sigma in nm, epsilon in kJ/mol
     nonbonded_params: dict[str, tuple[float, float]]
 
     # Temperature used for Boltzmann inversion
@@ -61,6 +75,11 @@ class CGForceField:
             "angles": {
                 k: {"x0": v.x0, "k": v.k, "n_samples": v.n_samples}
                 for k, v in self.angle_params.items()
+            },
+            "dihedrals": {
+                k: {"phi0": v.phi0, "k": v.k, "n": v.n,
+                    "n_samples": v.n_samples}
+                for k, v in self.dihedral_params.items()
             },
             "nonbonded": {
                 k: {"sigma": v[0], "epsilon": v[1]}
@@ -84,6 +103,11 @@ class CGForceField:
             angle_params={
                 k: HarmonicParams(v["x0"], v["k"], v["n_samples"])
                 for k, v in data["angles"].items()
+            },
+            dihedral_params={
+                k: DihedralParams(v["phi0"], v["k"], v["n"],
+                                  v["n_samples"])
+                for k, v in data.get("dihedrals", {}).items()
             },
             nonbonded_params={
                 k: (v["sigma"], v["epsilon"])
@@ -169,6 +193,64 @@ def boltzmann_invert_harmonic(
     return HarmonicParams(x0=x0_fit, k=k_fit, n_samples=n_samples)
 
 
+def boltzmann_invert_dihedral(
+    samples: np.ndarray,
+    temperature: float,
+    n_bins: int = 72,
+) -> DihedralParams:
+    """Derive periodic dihedral parameters via Boltzmann inversion.
+
+    Fits U = k * (1 + cos(n*phi - phi0)) by trying multiplicities 1-3
+    and picking the best fit.
+    """
+    kbt = KB * temperature
+    n_samples = len(samples)
+
+    if n_samples < 10:
+        return DihedralParams(phi0=0.0, k=kbt, n=1, n_samples=n_samples)
+
+    # Histogram over [-pi, pi]
+    counts, bin_edges = np.histogram(
+        samples, bins=n_bins, range=(-np.pi, np.pi), density=True,
+    )
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+    mask = counts > 0
+    x = bin_centers[mask]
+    p = counts[mask]
+    pmf = -kbt * np.log(p)
+    pmf -= pmf.min()
+
+    # Try multiplicities 1, 2, 3 and pick best fit
+    best_residual = np.inf
+    best_params = DihedralParams(phi0=0.0, k=kbt, n=1, n_samples=n_samples)
+
+    for mult in [1, 2, 3]:
+        def periodic(phi, k, phi0, _n=mult):
+            return k * (1.0 + np.cos(_n * phi - phi0))
+
+        try:
+            popt, _ = curve_fit(
+                periodic, x, pmf,
+                p0=[pmf.max() / 2, 0.0],
+                maxfev=5000,
+            )
+            k_fit = float(abs(popt[0]))
+            phi0_fit = float(popt[1])
+            residual = float(np.sum((periodic(x, k_fit, phi0_fit) - pmf) ** 2))
+
+            if residual < best_residual and k_fit > 0.01:
+                best_residual = residual
+                best_params = DihedralParams(
+                    phi0=phi0_fit, k=k_fit, n=mult,
+                    n_samples=n_samples,
+                )
+        except (RuntimeError, ValueError):
+            continue
+
+    return best_params
+
+
 def derive_lj_from_rdf(
     distances: np.ndarray,
     temperature: float,
@@ -240,6 +322,7 @@ def parameterize_forcefield(
     # Pool distributions across all molecules
     pooled_bonds: dict[str, list[float]] = {}
     pooled_angles: dict[str, list[float]] = {}
+    pooled_dihedrals: dict[str, list[float]] = {}
     pooled_nonbond: dict[str, list[float]] = {}
     source_molecules = []
 
@@ -253,6 +336,8 @@ def parameterize_forcefield(
             pooled_bonds.setdefault(k, []).extend(v)
         for k, v in result.angle_distributions.items():
             pooled_angles.setdefault(k, []).extend(v)
+        for k, v in result.dihedral_distributions.items():
+            pooled_dihedrals.setdefault(k, []).extend(v)
         for k, v in result.nonbonded_distances.items():
             pooled_nonbond.setdefault(k, []).extend(v)
 
@@ -260,6 +345,7 @@ def parameterize_forcefield(
         print(f"\nPooled from {len(source_molecules)} molecules:")
         print(f"  Bond types: {len(pooled_bonds)}")
         print(f"  Angle types: {len(pooled_angles)}")
+        print(f"  Dihedral types: {len(pooled_dihedrals)}")
         print(f"  Non-bonded types: {len(pooled_nonbond)}")
 
     # --- Boltzmann inversion for bonds ---
@@ -289,6 +375,20 @@ def parameterize_forcefield(
                   f"k={params.k:.1f} kJ/mol/rad², "
                   f"n={params.n_samples}")
 
+    # --- Boltzmann inversion for dihedrals ---
+    dihedral_params = {}
+    if verbose:
+        print("\nFitting dihedral potentials:")
+    for key, samples in sorted(pooled_dihedrals.items()):
+        arr = np.array(samples)
+        params = boltzmann_invert_dihedral(arr, temperature)
+        dihedral_params[key] = params
+        if verbose:
+            deg = np.degrees(params.phi0)
+            print(f"  {key}: phi0={deg:.1f} deg, "
+                  f"k={params.k:.2f} kJ/mol, n={params.n}, "
+                  f"samples={params.n_samples}")
+
     # --- Non-bonded LJ from RDF ---
     nonbonded_params = {}
     if verbose:
@@ -305,6 +405,7 @@ def parameterize_forcefield(
     ff = CGForceField(
         bond_params=bond_params,
         angle_params=angle_params,
+        dihedral_params=dihedral_params,
         nonbonded_params=nonbonded_params,
         temperature=temperature,
         source_molecules=source_molecules,
@@ -313,6 +414,7 @@ def parameterize_forcefield(
     if verbose:
         print(f"\nForce field: {len(bond_params)} bond types, "
               f"{len(angle_params)} angle types, "
+              f"{len(dihedral_params)} dihedral types, "
               f"{len(nonbonded_params)} non-bonded types")
 
     return ff

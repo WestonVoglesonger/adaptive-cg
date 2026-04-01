@@ -2,12 +2,11 @@
 
 ## Project
 
-CLI tool (`acg`) for adaptive resolution coarse-grained molecular dynamics. Two phases completed:
+CLI tool (`acg`) for adaptive resolution coarse-grained molecular dynamics. Three phases completed:
 
 1. **Mapping problem solved** — k-means clustering produces near-optimal CG mappings in <1 second
 2. **CG simulation engine working** — full pipeline from PDB → force field → CG MD trajectory
-
-Next phase: adaptive resolution controller (dynamic remapping during simulation).
+3. **Adaptive resolution controller** — periodic remapping based on per-region RMSF activity monitoring
 
 Repo: github.com/WestonVoglesonger/adaptive-cg
 AA simulations run in Google Colab (free T4 GPU). CG simulations run locally (M1 Mac).
@@ -27,6 +26,7 @@ src/adaptive_cg/
     extract.py         # Map AA trajectory → CG distributions by bead class
     parameterize.py    # Boltzmann inversion → transferable CG force field
     engine.py          # CG MD engine: forces, Verlet integrator, Langevin thermostat
+    adaptive.py        # Adaptive resolution controller: activity monitor, remapping, allocation
   commands/
     fetch.py           # Download PDB structures (42 molecules across 4 categories)
     list_molecules.py  # Show downloaded structures
@@ -42,6 +42,7 @@ src/adaptive_cg/
     extract.py         # Extract CG distributions from AA trajectory
     parameterize.py    # Derive transferable CG force field
     cg_simulate.py     # Run CG MD simulation
+    adaptive_simulate.py # Run adaptive resolution CG MD
   notebooks/
     aa_simulate_colab.ipynb  # Batch AA simulations on Colab GPU
 ```
@@ -69,8 +70,11 @@ acg extract 1UBQ                     # Maps trajectory → bead class distributi
 # 4. Derive transferable CG force field (pool across molecules)
 acg parameterize                     # Boltzmann inversion → cg_forcefield.json
 
-# 5. Run CG MD simulation
+# 5. Run CG MD simulation (fixed resolution)
 acg cg-simulate 1UBQ --steps 100000  # ~2 min for 1 ns, 150 beads
+
+# 6. Run adaptive resolution CG MD
+acg adaptive-simulate 1UBQ --steps 100000 --n-regions 5 --activity-weight 0.7
 ```
 
 ## Key conventions
@@ -104,11 +108,20 @@ Trained on 6 molecules (1CRN, 1UBQ, 1LYZ, 1BNA, 1IGD, 1PGA — 5 proteins + 1 DN
 - PyTorch differentiable optimizer underperforms k-means (regularization fights reconstruction)
 - CG engine equilibrates to target temperature (~300-370 K) within ~50k steps
 
+## Adaptive controller (completed)
+
+- **ActivityMonitor**: sliding-window per-bead RMSF tracking
+- **Region partitioning**: molecule divided into N sequential chain regions
+- **Activity-based allocation**: beads redistributed proportional to `(1-w)*size + w*activity`
+- **Capped remapping**: max ±5 beads per region per check to avoid energy spikes
+- **Atom position estimation**: intra-bead structure preserved, bead-level displacement applied
+- **Post-remap protocol**: energy minimization (5k steps) + velocity re-thermalization
+- Tested on 1UBQ: 5 remaps over 10k steps, final T=277 K (target 300), most active region got 37% of beads
+
 ## What's next
 
-- **Adaptive resolution controller** — the core contribution:
-  - Activity monitor (RMSF, energy per region)
-  - Decision function: when/where to add/remove beads
-  - Remapping strategies: fixed, periodic with interpolation, continuous (AdResS-style)
-  - Force field transition handling (avoid energy discontinuities)
+- **Continuous adaptive (AdResS-style)**: dual-resolution with spatial switching function
+- **Force field interpolation**: smooth λ-transition between old/new topologies during remap
+- **Variable total bead count**: allow controller to increase/decrease total beads based on global activity
+- **Benchmarking**: compare adaptive vs fixed resolution on multiple molecules
 - Entropy/thermodynamics layer (kept separate from static geometry)

@@ -16,6 +16,13 @@ import numpy as np
 # Boltzmann constant in kJ/(mol·K)
 KB = 0.008314462618
 
+# Try to import Rust backend
+try:
+    import cg_engine as _rs
+    _HAS_RUST = True
+except ImportError:
+    _HAS_RUST = False
+
 
 # ---------------------------------------------------------------------------
 # Force field loader
@@ -39,10 +46,17 @@ class LJParam:
     epsilon: float  # kJ/mol
 
 
+@dataclass
+class DihedralParam:
+    phi0: float     # phase angle (radians)
+    k: float        # force constant (kJ/mol)
+    n: int          # multiplicity
+
+
 def load_forcefield(path: Path) -> dict:
     """Load force field parameters from JSON.
 
-    Returns dict with keys: bonds, angles, nonbonded, temperature.
+    Returns dict with keys: bonds, angles, dihedrals, nonbonded, temperature.
     Values are dicts keyed by class pair strings.
     """
     with open(path) as f:
@@ -56,6 +70,10 @@ def load_forcefield(path: Path) -> dict:
     for key, v in data["angles"].items():
         angles[key] = AngleParam(theta0=v["x0"], k=v["k"])
 
+    dihedrals = {}
+    for key, v in data.get("dihedrals", {}).items():
+        dihedrals[key] = DihedralParam(phi0=v["phi0"], k=v["k"], n=v["n"])
+
     nonbonded = {}
     for key, v in data["nonbonded"].items():
         nonbonded[key] = LJParam(sigma=v["sigma"], epsilon=v["epsilon"])
@@ -63,6 +81,7 @@ def load_forcefield(path: Path) -> dict:
     return {
         "bonds": bonds,
         "angles": angles,
+        "dihedrals": dihedrals,
         "nonbonded": nonbonded,
         "temperature": data["temperature"],
     }
@@ -214,11 +233,62 @@ class CGSystem:
     bond_params: list[BondParam]
     angle_list: list[tuple[int, int, int]]
     angle_params: list[AngleParam]
+    dihedral_list: list[tuple[int, int, int, int]]
+    dihedral_params: list[DihedralParam]
     nb_pairs: list[tuple[int, int]]
     nb_params: list[LJParam]
 
+    # Cached flat arrays for Rust backend (built lazily)
+    _topo_arrays: dict | None = field(default=None, repr=False)
+
+    def _get_topo_arrays(self) -> dict:
+        """Build flat numpy arrays from topology lists (cached)."""
+        if self._topo_arrays is not None:
+            return self._topo_arrays
+        bl = self.bond_list
+        self._topo_arrays = {
+            "bond_i": np.array([b[0] for b in bl], dtype=np.int64),
+            "bond_j": np.array([b[1] for b in bl], dtype=np.int64),
+            "bond_r0": np.array([p.r0 for p in self.bond_params]),
+            "bond_k": np.array([p.k for p in self.bond_params]),
+            "angle_i": np.array([a[0] for a in self.angle_list], dtype=np.int64),
+            "angle_j": np.array([a[1] for a in self.angle_list], dtype=np.int64),
+            "angle_k": np.array([a[2] for a in self.angle_list], dtype=np.int64),
+            "angle_theta0": np.array([p.theta0 for p in self.angle_params]),
+            "angle_k_param": np.array([p.k for p in self.angle_params]),
+            "dih_i": np.array([d[0] for d in self.dihedral_list], dtype=np.int64),
+            "dih_j": np.array([d[1] for d in self.dihedral_list], dtype=np.int64),
+            "dih_k": np.array([d[2] for d in self.dihedral_list], dtype=np.int64),
+            "dih_l": np.array([d[3] for d in self.dihedral_list], dtype=np.int64),
+            "dih_phi0": np.array([p.phi0 for p in self.dihedral_params]),
+            "dih_k_param": np.array([p.k for p in self.dihedral_params]),
+            "dih_n": np.array([p.n for p in self.dihedral_params], dtype=np.int64),
+            "pair_i": np.array([p[0] for p in self.nb_pairs], dtype=np.int64),
+            "pair_j": np.array([p[1] for p in self.nb_pairs], dtype=np.int64),
+            "pair_sigma": np.array([p.sigma for p in self.nb_params]),
+            "pair_epsilon": np.array([p.epsilon for p in self.nb_params]),
+        }
+        return self._topo_arrays
+
     def compute_forces(self, cutoff: float = 1.5) -> tuple[np.ndarray, dict]:
         """Compute total forces and per-component energies."""
+        if _HAS_RUST:
+            t = self._get_topo_arrays()
+            forces, e_bond, e_angle, e_dih, e_nb, e_total = _rs.compute_all_forces(
+                self.positions, t["bond_i"], t["bond_j"], t["bond_r0"], t["bond_k"],
+                t["angle_i"], t["angle_j"], t["angle_k"],
+                t["angle_theta0"], t["angle_k_param"],
+                t["dih_i"], t["dih_j"], t["dih_k"], t["dih_l"],
+                t["dih_phi0"], t["dih_k_param"], t["dih_n"],
+                t["pair_i"], t["pair_j"], t["pair_sigma"], t["pair_epsilon"],
+                cutoff,
+            )
+            energies = {
+                "bond": e_bond, "angle": e_angle, "dihedral": e_dih,
+                "nonbonded": e_nb, "potential": e_total,
+            }
+            return np.asarray(forces), energies
+
         f_bond, e_bond = compute_bond_forces(
             self.positions, self.bond_list, self.bond_params
         )
@@ -228,13 +298,10 @@ class CGSystem:
         f_nb, e_nb = compute_nonbonded_forces(
             self.positions, self.nb_pairs, self.nb_params, cutoff
         )
-
         total_forces = f_bond + f_angle + f_nb
         energies = {
-            "bond": e_bond,
-            "angle": e_angle,
-            "nonbonded": e_nb,
-            "potential": e_bond + e_angle + e_nb,
+            "bond": e_bond, "angle": e_angle,
+            "nonbonded": e_nb, "potential": e_bond + e_angle + e_nb,
         }
         return total_forces, energies
 
@@ -245,7 +312,6 @@ class CGSystem:
     def temperature(self) -> float:
         """Instantaneous temperature from kinetic energy."""
         ke = self.kinetic_energy()
-        # T = 2*KE / (n_dof * kB), n_dof = 3*N - 3 (remove COM translation)
         n_dof = max(3 * self.n_beads - 3, 1)
         return 2.0 * ke / (n_dof * KB)
 
@@ -260,27 +326,27 @@ def minimize_energy(
 ) -> float:
     """Steepest descent energy minimization with force capping.
 
-    Moves beads along force direction with capped step size to
-    remove bad contacts before MD.
-
-    Parameters
-    ----------
-    system : CGSystem
-    max_steps : int
-        Maximum minimization steps.
-    step_size : float
-        Initial step size in nm.
-    force_cap : float
-        Maximum force magnitude per bead (kJ/mol/nm).
-    tolerance : float
-        Stop when max force < tolerance (kJ/mol/nm).
-    verbose : bool
-        Print progress.
-
-    Returns
-    -------
-    float : final potential energy
+    Uses Rust backend if available.
     """
+    if _HAS_RUST:
+        if verbose:
+            _, energies = system.compute_forces()
+            print(f"Minimizing energy (initial PE={energies['potential']:.1f} kJ/mol) [Rust]")
+        t = system._get_topo_arrays()
+        final_pe = _rs.minimize_energy_rs(
+            system.positions,
+            t["bond_i"], t["bond_j"], t["bond_r0"], t["bond_k"],
+            t["angle_i"], t["angle_j"], t["angle_k"],
+            t["angle_theta0"], t["angle_k_param"],
+            t["dih_i"], t["dih_j"], t["dih_k"], t["dih_l"],
+            t["dih_phi0"], t["dih_k_param"], t["dih_n"],
+            t["pair_i"], t["pair_j"], t["pair_sigma"], t["pair_epsilon"],
+            1.5, max_steps, step_size, force_cap, tolerance,
+        )
+        if verbose:
+            print(f"  Finished {max_steps} steps: PE={final_pe:.1f} [Rust]")
+        return final_pe
+
     if verbose:
         forces, energies = system.compute_forces()
         print(f"Minimizing energy (initial PE={energies['potential']:.1f} kJ/mol)")
@@ -326,6 +392,9 @@ def setup_cg_system(
     n_beads: int | None = None,
     ratio: int = 4,
     temperature: float = 300.0,
+    bond_scale: float = 1.0,
+    angle_scale: float = 1.0,
+    dihedral_scale: float = 1.0,
     verbose: bool = True,
 ) -> CGSystem:
     """Set up a CG system from a PDB file and force field.
@@ -422,10 +491,13 @@ def setup_cg_system(
         bead_keys.append(bc.key)
 
     # Detect topology
+    from adaptive_cg.core.extract import detect_dihedrals
     bonds = detect_bonds(mapping, n_atoms)
     angles = detect_angles(bonds)
+    dihedrals = detect_dihedrals(bonds)
     if verbose:
-        print(f"Topology: {len(bonds)} bonds, {len(angles)} angles")
+        print(f"Topology: {len(bonds)} bonds, {len(angles)} angles, "
+              f"{len(dihedrals)} dihedrals")
 
     # Match force field parameters
     bond_list = []
@@ -435,7 +507,8 @@ def setup_cg_system(
         key = "--".join(sorted([bead_keys[i], bead_keys[j]]))
         if key in ff["bonds"]:
             bond_list.append((i, j))
-            bond_params.append(ff["bonds"][key])
+            p = ff["bonds"][key]
+            bond_params.append(BondParam(r0=p.r0, k=p.k * bond_scale))
         else:
             n_bond_missing += 1
 
@@ -445,19 +518,28 @@ def setup_cg_system(
     for i, j, k in angles:
         key = "--".join([bead_keys[i], bead_keys[j], bead_keys[k]])
         key_rev = "--".join([bead_keys[k], bead_keys[j], bead_keys[i]])
-        if key in ff["angles"]:
+        p = ff["angles"].get(key) or ff["angles"].get(key_rev)
+        if p:
             angle_list_out.append((i, j, k))
-            angle_params.append(ff["angles"][key])
-        elif key_rev in ff["angles"]:
-            angle_list_out.append((i, j, k))
-            angle_params.append(ff["angles"][key_rev])
+            angle_params.append(AngleParam(theta0=p.theta0, k=p.k * angle_scale))
         else:
             n_angle_missing += 1
 
+    # Match dihedrals
+    dihedral_list = []
+    dihedral_params = []
+    n_dih_missing = 0
+    for i, j, k, l in dihedrals:
+        key = "--".join([bead_keys[i], bead_keys[j], bead_keys[k], bead_keys[l]])
+        key_rev = "--".join([bead_keys[l], bead_keys[k], bead_keys[j], bead_keys[i]])
+        p = ff["dihedrals"].get(key) or ff["dihedrals"].get(key_rev)
+        if p:
+            dihedral_list.append((i, j, k, l))
+            dihedral_params.append(DihedralParam(phi0=p.phi0, k=p.k * dihedral_scale, n=p.n))
+        else:
+            n_dih_missing += 1
+
     # Non-bonded pairs: exclude 1-2, 1-3, and 1-4 neighbors.
-    # In a linear chain of beads, neighbors up to 4 bonds apart are
-    # close by construction and their interactions are already captured
-    # by bond/angle/dihedral terms. LJ on these causes blowup.
     from collections import defaultdict
     neighbors = defaultdict(set)
     for i, j in bonds:
@@ -507,10 +589,18 @@ def setup_cg_system(
 
     if verbose:
         print(f"Parameters matched: {len(bond_list)} bonds, "
-              f"{len(angle_list_out)} angles, {len(nb_pairs)} non-bonded pairs")
-        if n_bond_missing or n_angle_missing or n_nb_missing:
+              f"{len(angle_list_out)} angles, {len(dihedral_list)} dihedrals, "
+              f"{len(nb_pairs)} non-bonded pairs")
+        scales = []
+        if bond_scale != 1.0: scales.append(f"bond={bond_scale}")
+        if angle_scale != 1.0: scales.append(f"angle={angle_scale}")
+        if dihedral_scale != 1.0: scales.append(f"dihedral={dihedral_scale}")
+        if scales:
+            print(f"  Scaling: {', '.join(scales)}")
+        if n_bond_missing or n_angle_missing or n_dih_missing or n_nb_missing:
             print(f"  Missing: {n_bond_missing} bonds, "
-                  f"{n_angle_missing} angles, {n_nb_missing} non-bonded")
+                  f"{n_angle_missing} angles, {n_dih_missing} dihedrals, "
+                  f"{n_nb_missing} non-bonded")
 
     # Initialize velocities (Maxwell-Boltzmann)
     velocities = np.zeros((n_beads, 3))
@@ -539,6 +629,8 @@ def setup_cg_system(
         bond_params=bond_params,
         angle_list=angle_list_out,
         angle_params=angle_params,
+        dihedral_list=dihedral_list,
+        dihedral_params=dihedral_params,
         nb_pairs=nb_pairs,
         nb_params=nb_params_list,
     )
@@ -598,33 +690,29 @@ def langevin_step(
 ) -> np.ndarray:
     """One Langevin dynamics step (BAOAB splitting).
 
-    Adds friction and random forces to maintain temperature.
-
-    Parameters
-    ----------
-    system : CGSystem
-    forces : np.ndarray, shape (n_beads, 3)
-    dt : float
-        Timestep in ps.
-    temperature : float
-        Target temperature in Kelvin.
-    friction : float
-        Friction coefficient in 1/ps.
-
-    Returns
-    -------
-    new_forces : np.ndarray
+    Uses Rust backend if available (100x+ faster).
     """
+    if _HAS_RUST:
+        t = system._get_topo_arrays()
+        new_f, _, _, _, _, _ = _rs.langevin_step_rs(
+            system.positions, system.velocities, system.masses,
+            forces, dt, temperature, friction,
+            t["bond_i"], t["bond_j"], t["bond_r0"], t["bond_k"],
+            t["angle_i"], t["angle_j"], t["angle_k"],
+            t["angle_theta0"], t["angle_k_param"],
+            t["dih_i"], t["dih_j"], t["dih_k"], t["dih_l"],
+            t["dih_phi0"], t["dih_k_param"], t["dih_n"],
+            t["pair_i"], t["pair_j"], t["pair_sigma"], t["pair_epsilon"],
+            1.5,
+        )
+        return np.asarray(new_f)
+
     m = system.masses[:, None]
     half_dt = 0.5 * dt
 
-    # B: half-step velocity from forces
     system.velocities += half_dt * forces / m
-
-    # A: half-step position
     system.positions += half_dt * system.velocities
 
-    # O: Ornstein-Uhlenbeck (thermostat)
     c1 = np.exp(-friction * dt)
     c2 = np.sqrt((1.0 - c1 * c1) * KB * temperature)
     for i in range(system.n_beads):
@@ -634,13 +722,8 @@ def langevin_step(
             + sigma * np.random.normal(size=3)
         )
 
-    # A: half-step position
     system.positions += half_dt * system.velocities
-
-    # Compute new forces
     new_forces, _ = system.compute_forces()
-
-    # B: half-step velocity from new forces
     system.velocities += half_dt * new_forces / m
 
     return new_forces

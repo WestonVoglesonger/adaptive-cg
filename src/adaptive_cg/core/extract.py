@@ -196,6 +196,69 @@ def detect_angles(
     return sorted(angles)
 
 
+def detect_dihedrals(
+    bonds: list[tuple[int, int]],
+) -> list[tuple[int, int, int, int]]:
+    """Detect dihedral quadruplets (i, j, k, l) from bonded pairs.
+
+    A dihedral exists for each consecutive chain i-j-k-l where
+    i-j, j-k, and k-l are all bonded.
+    """
+    from collections import defaultdict
+    neighbors = defaultdict(set)
+    for i, j in bonds:
+        neighbors[i].add(j)
+        neighbors[j].add(i)
+
+    dihedrals = set()
+    for j, k in bonds:
+        for i in neighbors[j]:
+            if i == k:
+                continue
+            for l in neighbors[k]:
+                if l == j or l == i:
+                    continue
+                # Canonical ordering: ensure i < l to avoid duplicates
+                if i < l:
+                    dihedrals.add((i, j, k, l))
+                else:
+                    dihedrals.add((l, k, j, i))
+
+    return sorted(dihedrals)
+
+
+def compute_dihedral_angle(
+    p1: np.ndarray, p2: np.ndarray,
+    p3: np.ndarray, p4: np.ndarray,
+) -> float:
+    """Compute dihedral angle between planes (p1,p2,p3) and (p2,p3,p4).
+
+    Returns angle in radians, range [-pi, pi].
+    """
+    b1 = p2 - p1
+    b2 = p3 - p2
+    b3 = p4 - p3
+
+    n1 = np.cross(b1, b2)
+    n2 = np.cross(b2, b3)
+
+    n1_norm = np.linalg.norm(n1)
+    n2_norm = np.linalg.norm(n2)
+    if n1_norm < 1e-12 or n2_norm < 1e-12:
+        return 0.0
+
+    n1 = n1 / n1_norm
+    n2 = n2 / n2_norm
+
+    cos_phi = np.clip(np.dot(n1, n2), -1.0, 1.0)
+    # Sign from cross product
+    sign = np.sign(np.dot(n1, b3))
+    if sign == 0:
+        sign = 1.0
+
+    return float(sign * np.arccos(cos_phi))
+
+
 # ---------------------------------------------------------------------------
 # Distribution extraction
 # ---------------------------------------------------------------------------
@@ -233,12 +296,16 @@ class ExtractionResult:
     # Angle distributions: keyed by "classA--classB--classC"
     angle_distributions: dict[str, list[float]]
 
+    # Dihedral distributions: keyed by "classA--classB--classC--classD"
+    dihedral_distributions: dict[str, list[float]]
+
     # Non-bonded RDF samples: keyed by "classA--classB"
     nonbonded_distances: dict[str, list[float]]
 
     # Topology
     bonds: list[tuple[int, int]]
     angles: list[tuple[int, int, int]]
+    dihedrals: list[tuple[int, int, int, int]]
 
     def save(self, output_dir: Path):
         """Save extraction results to disk."""
@@ -253,6 +320,7 @@ class ExtractionResult:
             "bead_class_keys": self.bead_class_keys,
             "bonds": [[int(x) for x in b] for b in self.bonds],
             "angles": [[int(x) for x in a] for a in self.angles],
+            "dihedrals": [[int(x) for x in d] for d in self.dihedrals],
         }
         with open(output_dir / "meta.json", "w") as f:
             json.dump(meta, f, indent=2)
@@ -263,6 +331,9 @@ class ExtractionResult:
 
         for name, dist in self.angle_distributions.items():
             np.save(output_dir / f"angle_{name}.npy", np.array(dist))
+
+        for name, dist in self.dihedral_distributions.items():
+            np.save(output_dir / f"dihedral_{name}.npy", np.array(dist))
 
         for name, dist in self.nonbonded_distances.items():
             np.save(output_dir / f"nonbond_{name}.npy", np.array(dist))
@@ -283,6 +354,11 @@ class ExtractionResult:
             key = p.stem[6:]  # strip "angle_"
             angle_dists[key] = np.load(p).tolist()
 
+        dihedral_dists = {}
+        for p in input_dir.glob("dihedral_*.npy"):
+            key = p.stem[9:]  # strip "dihedral_"
+            dihedral_dists[key] = np.load(p).tolist()
+
         nonbond_dists = {}
         for p in input_dir.glob("nonbond_*.npy"):
             key = p.stem[8:]  # strip "nonbond_"
@@ -297,9 +373,11 @@ class ExtractionResult:
             bead_class_keys=meta["bead_class_keys"],
             bond_distributions=bond_dists,
             angle_distributions=angle_dists,
+            dihedral_distributions=dihedral_dists,
             nonbonded_distances=nonbond_dists,
             bonds=[tuple(b) for b in meta["bonds"]],
             angles=[tuple(a) for a in meta["angles"]],
+            dihedrals=[tuple(d) for d in meta.get("dihedrals", [])],
         )
 
 
@@ -410,8 +488,10 @@ def extract_distributions(
     # Detect topology
     bonds = detect_bonds(mapping, n_atoms)
     angles = detect_angles(bonds)
+    dihedrals = detect_dihedrals(bonds)
     if verbose:
-        print(f"Topology: {len(bonds)} bonds, {len(angles)} angles")
+        print(f"Topology: {len(bonds)} bonds, {len(angles)} angles, "
+              f"{len(dihedrals)} dihedrals")
 
     # Load trajectory
     traj_dcd = list(trajectory_dir.glob("*_traj.dcd"))
@@ -463,6 +543,7 @@ def extract_distributions(
     # --- Extract distributions across frames ---
     bond_dists: dict[str, list[float]] = {}
     angle_dists: dict[str, list[float]] = {}
+    dihedral_dists: dict[str, list[float]] = {}
     nonbond_dists: dict[str, list[float]] = {}
 
     # Prepare bond class keys
@@ -480,6 +561,14 @@ def extract_distributions(
         angle_class_keys.append(ak)
         if ak not in angle_dists:
             angle_dists[ak] = []
+
+    # Prepare dihedral class keys
+    dihedral_class_keys = []
+    for i, j, k, l in dihedrals:
+        dk = "--".join([bead_keys[i], bead_keys[j], bead_keys[k], bead_keys[l]])
+        dihedral_class_keys.append(dk)
+        if dk not in dihedral_dists:
+            dihedral_dists[dk] = []
 
     # Prepare non-bonded pairs (sample subset to avoid O(n²) explosion)
     bonded_set = set(bonds) | {(j, i) for i, j in bonds}
@@ -530,6 +619,13 @@ def extract_distributions(
             angle = float(np.arccos(np.clip(cos_angle, -1, 1)))
             angle_dists[angle_class_keys[angle_idx]].append(angle)
 
+        # Dihedrals
+        for dih_idx, (i, j, k, l) in enumerate(dihedrals):
+            phi = compute_dihedral_angle(
+                bead_pos[i], bead_pos[j], bead_pos[k], bead_pos[l],
+            )
+            dihedral_dists[dihedral_class_keys[dih_idx]].append(phi)
+
         # Non-bonded distances
         for nb_idx, (i, j) in enumerate(nonbond_pairs):
             dist = np.linalg.norm(bead_pos[i] - bead_pos[j])
@@ -542,6 +638,7 @@ def extract_distributions(
     if verbose:
         print(f"  Done. Bond types: {len(bond_dists)}, "
               f"Angle types: {len(angle_dists)}, "
+              f"Dihedral types: {len(dihedral_dists)}, "
               f"Non-bonded types: {len(nonbond_dists)}")
 
     return ExtractionResult(
@@ -553,7 +650,9 @@ def extract_distributions(
         bead_class_keys=bead_keys,
         bond_distributions=bond_dists,
         angle_distributions=angle_dists,
+        dihedral_distributions=dihedral_dists,
         nonbonded_distances=nonbond_dists,
         bonds=bonds,
         angles=angles,
+        dihedrals=dihedrals,
     )

@@ -1,4 +1,4 @@
-"""Command: run coarse-grained molecular dynamics simulation."""
+"""Command: run adaptive resolution CG MD simulation."""
 from __future__ import annotations
 
 import argparse
@@ -11,8 +11,8 @@ def setup_parser(parser: argparse.ArgumentParser):
         help="PDB ID (e.g. 1UBQ) — must already be fetched via `acg fetch`",
     )
     parser.add_argument(
-        "--steps", type=int, default=10000,
-        help="Number of integration steps (default: 10000)",
+        "--steps", type=int, default=100000,
+        help="Number of integration steps (default: 100000)",
     )
     parser.add_argument(
         "--dt", type=float, default=0.01,
@@ -32,7 +32,7 @@ def setup_parser(parser: argparse.ArgumentParser):
     )
     parser.add_argument(
         "--n-beads", type=int, default=None,
-        help="Number of CG beads (default: n_atoms // ratio)",
+        help="Total CG beads (fixed, redistributed by activity)",
     )
     parser.add_argument(
         "--ratio", type=int, default=4,
@@ -42,19 +42,32 @@ def setup_parser(parser: argparse.ArgumentParser):
         "--forcefield", type=str, default="data/forcefield/cg_forcefield.json",
         help="Path to CG force field JSON",
     )
-    # Force field scaling
+    # Adaptive parameters
     parser.add_argument(
-        "--bond-scale", type=float, default=1.0,
-        help="Scale bond force constants (default: 1.0)",
+        "--n-regions", type=int, default=5,
+        help="Number of chain regions to monitor (default: 5)",
     )
     parser.add_argument(
-        "--angle-scale", type=float, default=1.0,
-        help="Scale angle force constants (default: 1.0)",
+        "--remap-interval", type=int, default=5000,
+        help="Steps between remap checks (default: 5000)",
     )
     parser.add_argument(
-        "--dihedral-scale", type=float, default=1.0,
-        help="Scale dihedral force constants (default: 1.0)",
+        "--remap-threshold", type=int, default=3,
+        help="Min bead difference to trigger remap (default: 3)",
     )
+    parser.add_argument(
+        "--activity-weight", type=float, default=0.5,
+        help="Activity vs size weight for allocation, 0-1 (default: 0.5)",
+    )
+    parser.add_argument(
+        "--monitor-interval", type=int, default=100,
+        help="Steps between activity recordings (default: 100)",
+    )
+    parser.add_argument(
+        "--monitor-window", type=int, default=50,
+        help="Sliding window size for RMSF (default: 50)",
+    )
+    # Logging
     parser.add_argument(
         "--log-interval", type=int, default=100,
         help="Log energies every N steps (default: 100)",
@@ -65,12 +78,12 @@ def setup_parser(parser: argparse.ArgumentParser):
     )
     parser.add_argument(
         "--output-dir", type=str, default=None,
-        help="Output directory (default: data/cg_trajectories/<MOLECULE>)",
+        help="Output directory (default: data/adaptive_trajectories/<MOL>)",
     )
 
 
 def execute(args: argparse.Namespace) -> int:
-    from adaptive_cg.core.engine import setup_cg_system, run_cg_simulation
+    from adaptive_cg.core.adaptive import run_adaptive_simulation
 
     mol_id = args.molecule.upper()
     data_dir = Path("data")
@@ -90,58 +103,61 @@ def execute(args: argparse.Namespace) -> int:
     if args.output_dir:
         output_dir = Path(args.output_dir)
     else:
-        output_dir = data_dir / "cg_trajectories" / mol_id
+        output_dir = data_dir / "adaptive_trajectories" / mol_id
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     total_time = args.steps * args.dt
-    print(f"=== CG MD Simulation: {mol_id} ===")
+    print(f"=== Adaptive CG MD: {mol_id} ===")
     print(f"Steps: {args.steps}, dt={args.dt} ps, total={total_time:.2f} ps")
-    print(f"Temperature: {args.temperature} K")
-    print(f"Thermostat: {args.thermostat}")
+    print(f"Temperature: {args.temperature} K, thermostat: {args.thermostat}")
+    print(f"Regions: {args.n_regions}, remap every {args.remap_interval} steps")
+    print(f"Activity weight: {args.activity_weight}")
     print(f"Force field: {ff_path}")
     print(f"Output: {output_dir}")
     print()
 
-    # Setup system
-    system = setup_cg_system(
+    traj_path = output_dir / f"{mol_id}_adaptive_traj.npz"
+
+    log = run_adaptive_simulation(
         pdb_path=pdb_path,
         ff_path=ff_path,
         n_beads=args.n_beads,
         ratio=args.ratio,
-        temperature=args.temperature,
-        bond_scale=args.bond_scale,
-        angle_scale=args.angle_scale,
-        dihedral_scale=args.dihedral_scale,
-        verbose=True,
-    )
-
-    print()
-
-    # Run simulation
-    traj_path = output_dir / f"{mol_id}_cg_traj.npy"
-    log = run_cg_simulation(
-        system=system,
         n_steps=args.steps,
         dt=args.dt,
         temperature=args.temperature,
         friction=args.friction,
         thermostat=args.thermostat,
+        n_regions=args.n_regions,
+        monitor_interval=args.monitor_interval,
+        remap_check_interval=args.remap_interval,
+        remap_threshold=args.remap_threshold,
+        activity_weight=args.activity_weight,
+        monitor_window=args.monitor_window,
         log_interval=args.log_interval,
         save_interval=args.save_interval,
         trajectory_path=traj_path,
         verbose=True,
     )
 
-    # Save log
-    log_path = output_dir / f"{mol_id}_cg_log.csv"
+    # Save logs
+    log_path = output_dir / f"{mol_id}_adaptive_log.csv"
     log.save(log_path)
+
+    events_path = output_dir / f"{mol_id}_adaptive_events.json"
+    log.save_adaptive(events_path)
 
     print()
     print("=== Summary ===")
     print(f"Trajectory: {traj_path}")
-    print(f"Log: {log_path}")
-    print(f"Beads: {system.n_beads}")
+    print(f"Energy log: {log_path}")
+    print(f"Adaptive events: {events_path}")
+    print(f"Total remaps: {len(log.remap_steps)}")
+    if log.remap_steps:
+        for i, step in enumerate(log.remap_steps):
+            print(f"  Step {step}: "
+                  f"{log.remap_old_beads[i]} -> {log.remap_new_beads[i]} beads")
     if log.temperature:
         print(f"Final temperature: {log.temperature[-1]:.1f} K")
         print(f"Final total energy: {log.total_energy[-1]:.1f} kJ/mol")
