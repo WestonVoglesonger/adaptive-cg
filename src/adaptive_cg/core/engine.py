@@ -413,8 +413,8 @@ def project_contacts_to_beads(
     ref_atom_positions: np.ndarray,
     atom_masses: np.ndarray,
     bond_list: list,
-    base_epsilon: float = 5.0,
-    max_epsilon: float = 15.0,
+    base_epsilon: float = 10.0,
+    max_epsilon: float = 25.0,
 ) -> tuple[list[tuple[int, int]], list['LJParam']]:
     """Project atom-level contacts to bead-level Go contacts.
 
@@ -659,6 +659,10 @@ def setup_cg_system(
             p = ff["bonds"][key]
             bond_params.append(BondParam(r0=p.r0, k=p.k * bond_scale))
         else:
+            # Default bond: use actual distance, moderate force constant
+            r0 = float(np.linalg.norm(bead_positions[i] - bead_positions[j]))
+            bond_list.append((i, j))
+            bond_params.append(BondParam(r0=r0, k=200.0 * bond_scale))
             n_bond_missing += 1
 
     angle_list_out = []
@@ -672,6 +676,13 @@ def setup_cg_system(
             angle_list_out.append((i, j, k))
             angle_params.append(AngleParam(theta0=p.theta0, k=p.k * angle_scale))
         else:
+            # Default angle: use actual angle, moderate force constant
+            v1 = bead_positions[i] - bead_positions[j]
+            v2 = bead_positions[k] - bead_positions[j]
+            cos_t = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-12)
+            theta0 = float(np.arccos(np.clip(cos_t, -1, 1)))
+            angle_list_out.append((i, j, k))
+            angle_params.append(AngleParam(theta0=theta0, k=20.0 * angle_scale))
             n_angle_missing += 1
 
     # Match dihedrals
