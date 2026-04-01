@@ -14,7 +14,7 @@ def main():
     from adaptive_cg.commands import (
         fetch, evaluate, optimize, sweep, analyze, pareto, list_molecules,
         conformer, region_breakdown, compare_optimizers, simulate,
-        extract, parameterize, cg_simulate, adaptive_simulate,
+        extract, parameterize, cg_simulate, adaptive_simulate, run,
     )
 
     parser = argparse.ArgumentParser(
@@ -41,6 +41,8 @@ Examples:
   acg cg-simulate 1UBQ --steps 100000     # Longer CG run
   acg adaptive-simulate 1UBQ              # Run adaptive resolution CG MD
   acg adaptive-simulate 1UBQ --n-regions 5 --activity-weight 0.7
+  acg run 1UBQ                            # Auto-configured simulation
+  acg run 1UBQ --target-rate 1000         # Target 1000 steps/second
         """,
     )
 
@@ -62,6 +64,7 @@ Examples:
         "parameterize": (parameterize, "Derive transferable CG force field"),
         "cg-simulate": (cg_simulate, "Run coarse-grained MD simulation"),
         "adaptive-simulate": (adaptive_simulate, "Run adaptive resolution CG MD"),
+        "run": (run, "Auto-configured compute-aware CG simulation"),
     }
 
     for name, (module, help_text) in commands.items():
