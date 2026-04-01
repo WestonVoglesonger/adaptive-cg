@@ -478,19 +478,32 @@ def setup_cg_system(
                         if l != i and l != j:
                             exclude_set.add((min(i, l), max(i, l)))
 
+    # Compute per-bead effective radius from number of atoms.
+    # Assume each heavy atom occupies ~0.15 nm radius; bead radius
+    # scales as n_atoms^(1/3) for a roughly spherical cluster.
+    bead_radii = np.array([
+        0.15 * len(g) ** (1.0 / 3.0) for g in mapping
+    ])
+
     nb_pairs = []
     nb_params_list = []
     n_nb_missing = 0
+    default_epsilon = 2.0  # kJ/mol — weak attraction, gentle repulsion
     for i in range(n_beads):
         for j in range(i + 1, n_beads):
             if (i, j) in exclude_set:
                 continue
+            # Derive sigma from bead radii (Lorentz combining rule)
+            sigma_ij = bead_radii[i] + bead_radii[j]
+            # Use force field epsilon if available, otherwise default
             key = "--".join(sorted([bead_keys[i], bead_keys[j]]))
             if key in ff["nonbonded"]:
-                nb_pairs.append((i, j))
-                nb_params_list.append(ff["nonbonded"][key])
+                eps = ff["nonbonded"][key].epsilon
             else:
+                eps = default_epsilon
                 n_nb_missing += 1
+            nb_pairs.append((i, j))
+            nb_params_list.append(LJParam(sigma=sigma_ij, epsilon=eps))
 
     if verbose:
         print(f"Parameters matched: {len(bond_list)} bonds, "
