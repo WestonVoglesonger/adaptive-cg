@@ -336,35 +336,19 @@ def extract_distributions(
     ExtractionResult
     """
     import MDAnalysis as mda
-    from adaptive_cg.core.molecule import load_molecule
+    from adaptive_cg.core.molecule import (
+        WATER_RESNAMES, ION_RESNAMES, _detect_mol_type,
+    )
     from adaptive_cg.core.strategies import kmeans_mapping
 
-    mol = load_molecule(pdb_path)
-    if verbose:
-        print(f"Loaded molecule: {mol.name}, {mol.n_atoms} heavy atoms")
-
-    # Determine bead count
-    if n_beads is None:
-        n_beads = max(2, mol.n_atoms // ratio)
-    if verbose:
-        print(f"Target beads: {n_beads}")
-
-    # Generate mapping from static structure (k-means)
-    mapping = kmeans_mapping(mol.positions, mol.masses, n_beads)
-    if verbose:
-        sizes = [len(g) for g in mapping]
-        print(f"Mapping: {len(mapping)} beads, "
-              f"sizes {min(sizes)}-{max(sizes)} atoms/bead")
-
-    # Classify beads
-    elements = mol.elements
-    # Get atom names and residue names from the PDB
+    # Load heavy atoms directly — avoids DSSP dependency.
+    # We only need positions, masses, elements, atom/residue names for
+    # k-means mapping and bead classification. No region labels needed.
+    pdb_id = pdb_path.stem.upper()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         u_pdb = mda.Universe(str(pdb_path))
 
-    # Build heavy-atom selection matching molecule.py logic
-    from adaptive_cg.core.molecule import WATER_RESNAMES, ION_RESNAMES
     exclude_list = " ".join(sorted(WATER_RESNAMES | ION_RESNAMES))
     sel_string = f"not type H and not resname {exclude_list}"
     with warnings.catch_warnings():
@@ -376,13 +360,43 @@ def extract_distributions(
     if len(chains) > 1:
         ag = ag.select_atoms(f"segid {chains[0]}")
 
+    positions = ag.positions / 10.0  # Angstroms → nm
+    masses = ag.masses.copy()
+
+    # Filter zero-mass atoms
+    nonzero = masses > 0
+    if not nonzero.all():
+        positions = positions[nonzero]
+        masses = masses[nonzero]
+        ag = ag[nonzero]
+
+    elements = [a.element.strip() if a.element else a.name.strip()[0] for a in ag]
     atom_names = [a.name.strip() for a in ag]
     residue_names = [a.resname.strip() for a in ag]
+    n_atoms = len(ag)
+    mol_type = _detect_mol_type(residue_names)
 
+    if verbose:
+        print(f"Loaded molecule: {pdb_id}, {n_atoms} heavy atoms")
+
+    # Determine bead count
+    if n_beads is None:
+        n_beads = max(2, n_atoms // ratio)
+    if verbose:
+        print(f"Target beads: {n_beads}")
+
+    # Generate mapping from static structure (k-means)
+    mapping = kmeans_mapping(positions, masses, n_beads)
+    if verbose:
+        sizes = [len(g) for g in mapping]
+        print(f"Mapping: {len(mapping)} beads, "
+              f"sizes {min(sizes)}-{max(sizes)} atoms/bead")
+
+    # Classify beads
     bead_classes_list = []
     bead_keys = []
     for group in mapping:
-        bc = classify_bead(group, elements, atom_names, residue_names, mol.mol_type)
+        bc = classify_bead(group, elements, atom_names, residue_names, mol_type)
         bead_classes_list.append(bc.to_dict())
         bead_keys.append(bc.key)
 
@@ -394,7 +408,7 @@ def extract_distributions(
             print(f"  {k}: {count} beads")
 
     # Detect topology
-    bonds = detect_bonds(mapping, mol.n_atoms)
+    bonds = detect_bonds(mapping, n_atoms)
     angles = detect_angles(bonds)
     if verbose:
         print(f"Topology: {len(bonds)} bonds, {len(angles)} angles")
@@ -428,14 +442,14 @@ def extract_distributions(
     if len(heavy_chains) > 1:
         heavy_sel = heavy_sel.select_atoms(f"segid {heavy_chains[0]}")
 
-    if len(heavy_sel) != mol.n_atoms:
+    if len(heavy_sel) != n_atoms:
         # Solvated system may have slightly different atom count due to
         # hydrogen addition changing residue topology. Use closest match.
         if verbose:
             print(f"  Warning: heavy atom count mismatch "
-                  f"({len(heavy_sel)} vs {mol.n_atoms}). "
-                  f"Using min({len(heavy_sel)}, {mol.n_atoms}) atoms.")
-        n_use = min(len(heavy_sel), mol.n_atoms)
+                  f"({len(heavy_sel)} vs {n_atoms}). "
+                  f"Using min({len(heavy_sel)}, {n_atoms}) atoms.")
+        n_use = min(len(heavy_sel), n_atoms)
         # Trim mapping to fit
         trimmed_mapping = []
         for group in mapping:
@@ -488,15 +502,15 @@ def extract_distributions(
             nonbond_dists[k] = []
 
     # Process each frame
-    masses = mol.masses
+    masses = masses
     for frame_idx, ts in enumerate(u.trajectory):
         # Get heavy atom positions in nm
         all_pos = ts.positions / 10.0  # Angstroms → nm
         heavy_pos = all_pos[heavy_indices]
 
         # Trim to match mapping
-        if len(heavy_pos) > mol.n_atoms:
-            heavy_pos = heavy_pos[:mol.n_atoms]
+        if len(heavy_pos) > n_atoms:
+            heavy_pos = heavy_pos[:n_atoms]
 
         # Compute bead COM positions
         bead_pos = compute_bead_positions(mapping, heavy_pos, masses)
@@ -531,10 +545,10 @@ def extract_distributions(
               f"Non-bonded types: {len(nonbond_dists)}")
 
     return ExtractionResult(
-        molecule=mol.name,
+        molecule=pdb_id,
         n_frames=n_frames,
         n_beads=len(mapping),
-        n_atoms=mol.n_atoms,
+        n_atoms=n_atoms,
         bead_classes=bead_classes_list,
         bead_class_keys=bead_keys,
         bond_distributions=bond_dists,
